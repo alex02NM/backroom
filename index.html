@@ -13,6 +13,10 @@
 <div id="info">FPS: --</div>
 
 <audio id="backroomsMusic" autoplay></audio>
+
+<!-- NEW: entity whisper sound (plays randomly when near) -->
+<audio id="ghostWhisper" src="dragon-studio-ghost-whisper-351569.mp3" preload="auto"></audio>
+
 <script>
 const music=[
 "luxaeterna2026-dark-liminal-void-ambient-558010.mp3",
@@ -2136,6 +2140,112 @@ playNext();
     if (p && typeof p.catch === 'function') p.catch(() => {});
   }
 
+  // ============ ENTITY WHISPER AUDIO ============
+  const whisperEl = document.getElementById('ghostWhisper');
+  const WHISPER = {
+    NEAR_DIST:   48,     // start fading in within this distance (meters)
+    FAR_VOL:     0.0,    // volume at NEAR_DIST edge
+    MAX_VOL:     0.85,   // peak volume when very close
+    MIN_GAP:     2.5,    // seconds between random whisper triggers
+    MAX_GAP:     8.5,
+    UNLOCK_VOL:  0.001
+  };
+
+  const whisperState = {
+    nextPlayAt: performance.now() / 1000 + 2.0,
+    playing:    false,
+    baseVol:    0.0,
+    lastDistance: Infinity
+  };
+
+  if (whisperEl) {
+    whisperEl.volume = 0.0;
+    // fail silently if the file is missing — don't crash the app
+    whisperEl.addEventListener('error', () => {
+      console.warn('ghostWhisper audio failed to load:', whisperEl.src);
+    });
+  }
+
+  function playWhisperBurst(nowSec) {
+    if (!whisperEl) return;
+    try {
+      // seek to a random spot so it never sounds the same twice
+      const dur = isFinite(whisperEl.duration) && whisperEl.duration > 0
+        ? whisperEl.duration
+        : 4.0;
+      whisperEl.currentTime = Math.random() * Math.max(0.0, dur - 0.6);
+      whisperEl.playbackRate = 0.82 + Math.random() * 0.36;
+    } catch (e) { /* ignore */ }
+
+    const p = whisperEl.play();
+    if (p && typeof p.catch === 'function') p.catch(() => {});
+    whisperState.playing = true;
+    whisperState.nextPlayAt =
+      nowSec + WHISPER.MIN_GAP + Math.random() * (WHISPER.MAX_GAP - WHISPER.MIN_GAP);
+  }
+
+  function updateWhisper(dt, nowSec) {
+    if (!whisperEl) return;
+
+    // distance to the entity (only meaningful while it's visible/peeking)
+    const active = entity.houseIdx >= 0 && entity.p > 0.05;
+    let dist = Infinity;
+    if (active) {
+      const dx = entity.world[0] - player.pos[0];
+      const dy = entity.world[1] - player.pos[1];
+      const dz = entity.world[2] - player.pos[2];
+      dist = Math.hypot(dx, dy, dz);
+    }
+    whisperState.lastDistance = dist;
+
+    // is the player within whisper range?
+    const inRange = dist < WHISPER.NEAR_DIST;
+
+    if (!inRange) {
+      // fade out if a whisper is still playing
+      if (whisperState.playing) {
+        const v = whisperEl.volume;
+        if (v > 0.01) {
+          whisperEl.volume = Math.max(0, v - dt * 1.5);
+        } else {
+          whisperEl.volume = 0;
+          try { whisperEl.pause(); } catch (e) {}
+          whisperState.playing = false;
+        }
+      }
+      // even out of range, keep scheduling future random bursts so we
+      // don't fire instantly upon re-approaching
+      if (nowSec >= whisperState.nextPlayAt) {
+        whisperState.nextPlayAt =
+          nowSec + WHISPER.MIN_GAP + Math.random() * (WHISPER.MAX_GAP - WHISPER.MIN_GAP);
+      }
+      return;
+    }
+
+    // in-range: target volume scales with proximity
+    const t = 1.0 - dist / WHISPER.NEAR_DIST;      // 0 at edge, 1 at entity
+    const targetVol = WHISPER.FAR_VOL + t * (WHISPER.MAX_VOL - WHISPER.FAR_VOL);
+    whisperState.baseVol = targetVol;
+
+    // random scheduling: pick a new burst when the timer elapses
+    if (nowSec >= whisperState.nextPlayAt) {
+      playWhisperBurst(nowSec);
+    }
+
+    if (whisperState.playing) {
+      // smooth volume toward target
+      const v = whisperEl.volume;
+      whisperEl.volume = v + (targetVol - v) * Math.min(1, dt * 3.0);
+    }
+  }
+
+  function stopWhisper() {
+    if (!whisperEl) return;
+    try { whisperEl.pause(); } catch (e) {}
+    whisperEl.volume = 0;
+    whisperState.playing = false;
+  }
+
   // ============ FPS ============
   const infoEl = document.getElementById('info');
   let frames = 0, fpsTimer = performance.now();
@@ -2199,6 +2309,9 @@ playNext();
 
     updateLightMatrices();
     updateEntity(dt);
+
+    // NEW: random whisper when near the entity
+    updateWhisper(dt, time);
 
     mat4.multiply(viewProj, projectionMatrix, viewMatrix);
     extractFrustum(viewProj);
@@ -2323,12 +2436,14 @@ playNext();
     frames++;
     if (now - fpsTimer >= 500) {
       const fps = (frames * 1000) / (now - fpsTimer);
+      const wd = whisperState.lastDistance;
+      const wdStr = isFinite(wd) ? wd.toFixed(1) : '--';
       infoEl.textContent =
         'FPS: ' + fps.toFixed(1) + '   Houses: ' + houseInstances.length +
         '  Prototypes: ' + prototypes.length + '  Forms: ' + entityForms.length + '\n' +
         'WASD / Arrows: move   Shift: sprint\n' +
         'Click: mouse-look (Esc to release)   Drag: look\n' +
-        'R: reset view';
+        'R: reset view   Entity dist: ' + wdStr;
       frames = 0;
       fpsTimer = now;
     }
@@ -2343,6 +2458,11 @@ playNext();
     player.pos[0] = player.target[0];
     player.pos[1] = player.target[1];
     player.pos[2] = player.target[2];
+  });
+
+  // Pause the whisper if the tab is hidden
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) stopWhisper();
   });
 
   requestAnimationFrame(frame);
