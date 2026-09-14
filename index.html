@@ -12,8 +12,6 @@
 <body>
 <div id="info">FPS: --</div>
 
-
-
 <audio id="backroomsMusic" autoplay></audio>
 <script>
 const music=[
@@ -33,8 +31,6 @@ function playNext(){
 audio.addEventListener("ended",playNext);
 playNext();
 </script>
-
-
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/gl-matrix/2.4.0/gl-matrix.js"></script>
 <script>
@@ -533,14 +529,18 @@ playNext();
     }
   `;
 
-  // ============ HOUSE SHADOW PASS ============
+  // ============ HOUSE SHADERS — INSTANCED, TEXTURE-ARRAY ATLAS ============
   const houseShadowVS = `#version 300 es
     precision highp float;
     layout(location=0) in vec3 a_position;
+    layout(location=4) in vec3 a_instPos;
+    layout(location=5) in vec2 a_instRS;
     uniform mat4 u_lightViewProj;
-    uniform mat4 u_model;
     void main() {
-      gl_Position = u_lightViewProj * u_model * vec4(a_position, 1.0);
+      float c = cos(a_instRS.x), s = sin(a_instRS.x);
+      vec3 p = a_position * a_instRS.y;
+      vec3 wp = vec3(c * p.x + s * p.z, p.y, -s * p.x + c * p.z) + a_instPos;
+      gl_Position = u_lightViewProj * vec4(wp, 1.0);
     }
   `;
   const houseShadowFS = `#version 300 es
@@ -549,32 +549,40 @@ playNext();
     void main() { fragColor = vec4(1.0); }
   `;
 
-  // ============ HOUSE MAIN PASS ============
   const houseVS = `#version 300 es
     precision highp float;
     layout(location=0) in vec3 a_position;
     layout(location=1) in vec3 a_normal;
     layout(location=2) in vec2 a_uv;
-    uniform mat4 u_model;
+    layout(location=3) in float a_mat;
+    layout(location=4) in vec3 a_instPos;
+    layout(location=5) in vec2 a_instRS;
     uniform mat4 u_viewMatrix;
     uniform mat4 u_projectionMatrix;
     uniform mat4 u_lightViewProj;
     out vec3 v_worldPos;
     out vec3 v_normal;
     out vec2 v_uv;
+    out float v_mat;
     out vec4 v_lightSpacePos;
     void main() {
-      vec4 wp = u_model * vec4(a_position, 1.0);
-      v_worldPos = wp.xyz;
-      v_normal = mat3(u_model) * a_normal;
+      float c = cos(a_instRS.x), s = sin(a_instRS.x);
+      vec3 p = a_position * a_instRS.y;
+      vec3 wp = vec3(c * p.x + s * p.z, p.y, -s * p.x + c * p.z) + a_instPos;
+      vec3 n  = vec3(c * a_normal.x + s * a_normal.z, a_normal.y,
+                     -s * a_normal.x + c * a_normal.z);
+      v_worldPos = wp;
+      v_normal = n;
       v_uv = a_uv;
-      v_lightSpacePos = u_lightViewProj * wp;
-      gl_Position = u_projectionMatrix * u_viewMatrix * wp;
+      v_mat = a_mat;
+      v_lightSpacePos = u_lightViewProj * vec4(wp, 1.0);
+      gl_Position = u_projectionMatrix * u_viewMatrix * vec4(wp, 1.0);
     }
   `;
+
   const houseFS = `#version 300 es
     precision highp float;
-    uniform sampler2D u_texture;
+    uniform highp sampler2DArray u_texArray;
     uniform sampler2D u_shadowMap;
     uniform vec3 u_sunDir;
     uniform vec3 u_sunColor;
@@ -584,10 +592,10 @@ playNext();
     uniform vec3 u_cameraWorld;
     uniform float u_shadowBias;
     uniform int u_shadowEnabled;
-    uniform float u_texScale;
     in vec3 v_worldPos;
     in vec3 v_normal;
     in vec2 v_uv;
+    in float v_mat;
     in vec4 v_lightSpacePos;
     out vec4 outColor;
 
@@ -609,7 +617,8 @@ playNext();
     }
 
     void main() {
-      vec3 albedo = texture(u_texture, v_uv * u_texScale).rgb;
+      float layer = floor(v_mat + 0.5);
+      vec3 albedo = texture(u_texArray, vec3(v_uv, layer)).rgb;
       vec3 N = normalize(v_normal);
       vec3 L = normalize(u_sunDir);
       float NdotL = max(dot(N, L), 0.0);
@@ -631,16 +640,46 @@ playNext();
     }
   `;
 
-  // ============ ENTITY SHADERS (the tall thin black figure) ============
+  // ============ ENTITY SHADERS — ANIMATED ============
   const entityVS = `#version 300 es
     precision highp float;
     layout(location=0) in vec3 a_position;
+    layout(location=1) in float a_heightNorm;
     uniform mat4 u_model;
     uniform mat4 u_viewMatrix;
     uniform mat4 u_projectionMatrix;
+    uniform float u_time;
+    uniform float u_sway;
+    uniform float u_swaySpeed;
+    uniform float u_breath;
+    uniform float u_headTilt;
+    uniform float u_seed;
     out vec3 v_worldPos;
     void main() {
-      vec4 wp = u_model * vec4(a_position, 1.0);
+      float h  = clamp(a_heightNorm, 0.0, 1.0);
+      float hh = h * h;
+      float t  = u_time * u_swaySpeed + u_seed;
+
+      vec3 p = a_position;
+
+      // 1. slow pendulum sway
+      p.x += sin(t)              * u_sway * hh;
+      p.z += cos(t * 0.83 + 1.7) * u_sway * 0.75 * hh;
+
+      // 2. head tilts slowly, independently of the body
+      float headW = smoothstep(0.68, 0.90, h);
+      p.x += sin(t * 0.61 + 2.3) * u_headTilt * headW;
+      p.z += cos(t * 0.47 + 0.9) * u_headTilt * 0.6 * headW;
+
+      // 3. barely-visible breathing through the chest
+      float chest = smoothstep(0.30, 0.55, h) * (1.0 - smoothstep(0.55, 0.92, h));
+      p.y += sin(t * 1.4) * u_breath * 0.010 * chest;
+
+      // 4. rare harsh twitch
+      float twitch = sin(t * 11.3 + 0.4) * sin(t * 3.7 + u_seed);
+      p.x += twitch * u_sway * 0.20 * hh;
+
+      vec4 wp = u_model * vec4(p, 1.0);
       v_worldPos = wp.xyz;
       gl_Position = u_projectionMatrix * u_viewMatrix * wp;
     }
@@ -698,11 +737,11 @@ playNext();
   if (fboStatus !== gl.FRAMEBUFFER_COMPLETE) console.error('Shadow FBO incomplete:', fboStatus);
   gl.bindFramebuffer(gl.FRAMEBUFFER, null);
 
-  // ============ TEXTURE UPLOAD HELPER ============
-  function uploadTexture(canvas, useRepeat) {
+  // ============ TEXTURE HELPERS ============
+  function uploadTexture(cv, useRepeat) {
     const tex = gl.createTexture();
     gl.bindTexture(gl.TEXTURE_2D, tex);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, canvas);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, cv);
     gl.generateMipmap(gl.TEXTURE_2D);
     if (useRepeat) {
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
@@ -721,7 +760,30 @@ playNext();
     return tex;
   }
 
-  // ============ GRASS TEXTURE (original glitchy strips) ============
+  function makeTextureArray(canvases) {
+    const S = canvases[0].width;
+    const tex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D_ARRAY, tex);
+    gl.texImage3D(gl.TEXTURE_2D_ARRAY, 0, gl.RGBA8, S, S, canvases.length, 0,
+                  gl.RGBA, gl.UNSIGNED_BYTE, null);
+    for (let i = 0; i < canvases.length; i++) {
+      gl.texSubImage3D(gl.TEXTURE_2D_ARRAY, 0, 0, 0, i, S, S, 1,
+                       gl.RGBA, gl.UNSIGNED_BYTE, canvases[i]);
+    }
+    gl.generateMipmap(gl.TEXTURE_2D_ARRAY);
+    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_S, gl.REPEAT);
+    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_T, gl.REPEAT);
+    const ext = gl.getExtension('EXT_texture_filter_anisotropic');
+    if (ext) {
+      const maxA = gl.getParameter(ext.MAX_TEXTURE_MAX_ANISOTROPY_EXT);
+      gl.texParameterf(gl.TEXTURE_2D_ARRAY, ext.TEXTURE_MAX_ANISOTROPY_EXT, Math.min(8, maxA));
+    }
+    return tex;
+  }
+
+  // ============ GRASS TEXTURE ============
   function makeGrassTexture(size) {
     const c = document.createElement('canvas');
     c.width = c.height = size;
@@ -763,7 +825,6 @@ playNext();
       d[i+2] = Math.max(0, Math.min(255, d[i+2] + n));
     }
     ctx.putImageData(img, 0, 0);
-    // ---- grass blades / strips (the glitchy look) ----
     for (let i = 0; i < 42000; i++) {
       const x = Math.random() * size, y = Math.random() * size;
       const len = 3 + Math.random() * 14;
@@ -786,8 +847,11 @@ playNext();
   }
   const grassTex = makeGrassTexture(1024);
 
-  // ============ HOUSE TEXTURES ============
-  function makeWallTexture(size) {
+  // ============ HOUSE TEXTURE CANVASES ============
+  const TEX_SIZE = 512;
+
+  function makeWallCanvas() {
+    const size = TEX_SIZE;
     const c = document.createElement('canvas');
     c.width = c.height = size;
     const ctx = c.getContext('2d');
@@ -818,10 +882,11 @@ playNext();
       d[i+2] = Math.max(0, Math.min(255, d[i+2] + n));
     }
     ctx.putImageData(img, 0, 0);
-    return uploadTexture(c, true);
+    return c;
   }
 
-  function makeRoofTexture(size) {
+  function makeRoofCanvas() {
+    const size = TEX_SIZE;
     const c = document.createElement('canvas');
     c.width = c.height = size;
     const ctx = c.getContext('2d');
@@ -852,10 +917,11 @@ playNext();
         }
       }
     }
-    return uploadTexture(c, true);
+    return c;
   }
 
-  function makeWindowTexture(size) {
+  function makeWindowCanvas() {
+    const size = TEX_SIZE;
     const c = document.createElement('canvas');
     c.width = c.height = size;
     const ctx = c.getContext('2d');
@@ -910,29 +976,29 @@ playNext();
     ctx.fillRect(size * 0.5 - mullW * 0.5 + mullW - 1, frameW, 1, size - 2*frameW);
     ctx.fillRect(frameW, size * 0.5 - mullW * 0.5 + mullW - 1, size - 2*frameW, 1);
 
-    return uploadTexture(c, false);
+    return c;
   }
 
-  function makeDoorTexture(size) {
+  function makeDoorCanvas() {
+    const size = TEX_SIZE;
     const c = document.createElement('canvas');
-    c.width = size;
-    c.height = size * 2;
+    c.width = c.height = size;
     const ctx = c.getContext('2d');
 
     ctx.fillStyle = '#5a3a20';
-    ctx.fillRect(0, 0, c.width, c.height);
+    ctx.fillRect(0, 0, size, size);
 
     for (let i = 0; i < 260; i++) {
-      const x = Math.random() * c.width;
+      const x = Math.random() * size;
       const shade = 0.65 + Math.random() * 0.55;
       ctx.fillStyle = `rgba(${Math.floor(95*shade)},${Math.floor(62*shade)},${Math.floor(30*shade)},0.35)`;
-      ctx.fillRect(x, 0, 1 + Math.random() * 1.5, c.height);
+      ctx.fillRect(x, 0, 1 + Math.random() * 1.5, size);
     }
 
-    const mx = c.width * 0.16;
-    const pw = c.width - 2*mx;
-    const gap = c.height * 0.055;
-    const ph = (c.height - gap*3) / 2;
+    const mx = size * 0.16;
+    const pw = size - 2 * mx;
+    const gap = size * 0.055;
+    const ph = (size - gap * 3) / 2;
 
     function drawPanel(y, h) {
       ctx.strokeStyle = 'rgba(0,0,0,0.7)';
@@ -945,168 +1011,738 @@ playNext();
       ctx.fillRect(mx + 2, y + h - 6, pw - 4, 4);
     }
     drawPanel(gap, ph);
-    drawPanel(gap*2 + ph, ph);
+    drawPanel(gap * 2 + ph, ph);
 
     ctx.fillStyle = '#d4a838';
     ctx.beginPath();
-    ctx.arc(c.width * 0.86, c.height * 0.54, c.width * 0.045, 0, Math.PI * 2);
+    ctx.arc(size * 0.86, size * 0.54, size * 0.045, 0, Math.PI * 2);
     ctx.fill();
     ctx.fillStyle = 'rgba(255,255,255,0.5)';
     ctx.beginPath();
-    ctx.arc(c.width * 0.855, c.height * 0.535, c.width * 0.012, 0, Math.PI * 2);
+    ctx.arc(size * 0.855, size * 0.535, size * 0.012, 0, Math.PI * 2);
     ctx.fill();
 
-    return uploadTexture(c, false);
+    return c;
   }
 
-  const wallTex   = makeWallTexture(512);
-  const roofTex   = makeRoofTexture(512);
-  const windowTex = makeWindowTexture(256);
-  const doorTex   = makeDoorTexture(256);
+  const MAT = { WALL: 0, ROOF: 1, WINDOW: 2, DOOR: 3 };
+  const houseTexArray = makeTextureArray([
+    makeWallCanvas(), makeRoofCanvas(), makeWindowCanvas(), makeDoorCanvas()
+  ]);
 
-  // ============ HOUSE GEOMETRY ============
-  const HOUSE = { W: 8.0, D: 6.0, H: 6.4, roofH: 2.4, ov: 0.4 };
+  // ============ PROCEDURAL HOUSE GENERATION ============
+  const TEX_SCALE = 2.0;
 
-  function buildHouseMeshes() {
-    const W = HOUSE.W, D = HOUSE.D, H = HOUSE.H;
-    const roofH = HOUSE.roofH, ov = HOUSE.ov;
-    const hw = W / 2, hd = D / 2;
-    const T = 2.0;
+  function buildHouseGeometry(P, lod) {
+    const g = { pos: [], nor: [], uv: [], mat: [], idx: [] };
 
-    const walls   = { pos: [], nor: [], uv: [], idx: [] };
-    const roof    = { pos: [], nor: [], uv: [], idx: [] };
-    const windows = { pos: [], nor: [], uv: [], idx: [] };
-    const door    = { pos: [], nor: [], uv: [], idx: [] };
+    const W = P.W, D = P.D, H = P.H, roofH = P.roofH, ov = P.ov;
+    const hw = W * 0.5, hd = D * 0.5;
 
-    function pushQuad(g, p0, p1, p2, p3, n, uvs) {
+    function quad(p0, p1, p2, p3, n, uvs, m) {
       const base = g.pos.length / 3;
       g.pos.push(p0[0],p0[1],p0[2], p1[0],p1[1],p1[2], p2[0],p2[1],p2[2], p3[0],p3[1],p3[2]);
-      g.nor.push(n[0],n[1],n[2], n[0],n[1],n[2], n[0],n[1],n[2], n[0],n[1],n[2]);
+      for (let i = 0; i < 4; i++) g.nor.push(n[0], n[1], n[2]);
       g.uv.push(uvs[0][0],uvs[0][1], uvs[1][0],uvs[1][1], uvs[2][0],uvs[2][1], uvs[3][0],uvs[3][1]);
+      for (let i = 0; i < 4; i++) g.mat.push(m);
       g.idx.push(base, base+1, base+2, base, base+2, base+3);
     }
-    function pushTri(g, p0, p1, p2, n, uvs) {
+    function tri(p0, p1, p2, n, uvs, m) {
       const base = g.pos.length / 3;
       g.pos.push(p0[0],p0[1],p0[2], p1[0],p1[1],p1[2], p2[0],p2[1],p2[2]);
-      g.nor.push(n[0],n[1],n[2], n[0],n[1],n[2], n[0],n[1],n[2]);
+      for (let i = 0; i < 3; i++) g.nor.push(n[0], n[1], n[2]);
       g.uv.push(uvs[0][0],uvs[0][1], uvs[1][0],uvs[1][1], uvs[2][0],uvs[2][1]);
+      for (let i = 0; i < 3; i++) g.mat.push(m);
       g.idx.push(base, base+1, base+2);
     }
+    function boxUV(a, b) {
+      return [[0,0],[a/TEX_SCALE,0],[a/TEX_SCALE,b/TEX_SCALE],[0,b/TEX_SCALE]];
+    }
+    function box(cx, cy, cz, sx, sy, sz, m) {
+      const x0=cx-sx*0.5, x1=cx+sx*0.5;
+      const y0=cy-sy*0.5, y1=cy+sy*0.5;
+      const z0=cz-sz*0.5, z1=cz+sz*0.5;
+      quad([x0,y0,z1],[x1,y0,z1],[x1,y1,z1],[x0,y1,z1],[0,0,1],  boxUV(sx,sy), m);
+      quad([x1,y0,z0],[x0,y0,z0],[x0,y1,z0],[x1,y1,z0],[0,0,-1], boxUV(sx,sy), m);
+      quad([x0,y0,z0],[x0,y0,z1],[x0,y1,z1],[x0,y1,z0],[-1,0,0], boxUV(sz,sy), m);
+      quad([x1,y0,z1],[x1,y0,z0],[x1,y1,z0],[x1,y1,z1],[1,0,0],  boxUV(sz,sy), m);
+      quad([x0,y1,z1],[x1,y1,z1],[x1,y1,z0],[x0,y1,z0],[0,1,0],  boxUV(sx,sz), m);
+      quad([x0,y0,z0],[x1,y0,z0],[x1,y0,z1],[x0,y0,z1],[0,-1,0], boxUV(sx,sz), m);
+    }
 
-    pushQuad(walls, [-hw,0,-hd], [hw,0,-hd], [hw,H,-hd], [-hw,H,-hd], [0,0,-1],
-      [[0,0],[W/T,0],[W/T,H/T],[0,H/T]]);
-    pushQuad(walls, [hw,0,hd], [-hw,0,hd], [-hw,H,hd], [hw,H,hd], [0,0,1],
-      [[0,0],[W/T,0],[W/T,H/T],[0,H/T]]);
-    pushQuad(walls, [-hw,0,hd], [-hw,0,-hd], [-hw,H,-hd], [-hw,H,hd], [-1,0,0],
-      [[0,0],[D/T,0],[D/T,H/T],[0,H/T]]);
-    pushQuad(walls, [hw,0,-hd], [hw,0,hd], [hw,H,hd], [hw,H,-hd], [1,0,0],
-      [[0,0],[D/T,0],[D/T,H/T],[0,H/T]]);
-    pushTri(walls, [-hw,H,-hd], [hw,H,-hd], [0,H+roofH,-hd], [0,0,-1],
-      [[0,H/T],[W/T,H/T],[W/2/T,(H+roofH)/T]]);
-    pushTri(walls, [hw,H,hd], [-hw,H,hd], [0,H+roofH,hd], [0,0,1],
-      [[0,H/T],[W/T,H/T],[W/2/T,(H+roofH)/T]]);
+    quad([-hw,0,-hd],[hw,0,-hd],[hw,H,-hd],[-hw,H,-hd],[0,0,-1],
+         [[0,0],[W/TEX_SCALE,0],[W/TEX_SCALE,H/TEX_SCALE],[0,H/TEX_SCALE]], MAT.WALL);
+    quad([hw,0,hd],[-hw,0,hd],[-hw,H,hd],[hw,H,hd],[0,0,1],
+         [[0,0],[W/TEX_SCALE,0],[W/TEX_SCALE,H/TEX_SCALE],[0,H/TEX_SCALE]], MAT.WALL);
+    quad([-hw,0,hd],[-hw,0,-hd],[-hw,H,-hd],[-hw,H,hd],[-1,0,0],
+         [[0,0],[D/TEX_SCALE,0],[D/TEX_SCALE,H/TEX_SCALE],[0,H/TEX_SCALE]], MAT.WALL);
+    quad([hw,0,-hd],[hw,0,hd],[hw,H,hd],[hw,H,-hd],[1,0,0],
+         [[0,0],[D/TEX_SCALE,0],[D/TEX_SCALE,H/TEX_SCALE],[0,H/TEX_SCALE]], MAT.WALL);
+
+    tri([-hw,H,-hd],[hw,H,-hd],[0,H+roofH,-hd],[0,0,-1],
+        [[0,H/TEX_SCALE],[W/TEX_SCALE,H/TEX_SCALE],[W*0.5/TEX_SCALE,(H+roofH)/TEX_SCALE]], MAT.WALL);
+    tri([hw,H,hd],[-hw,H,hd],[0,H+roofH,hd],[0,0,1],
+        [[0,H/TEX_SCALE],[W/TEX_SCALE,H/TEX_SCALE],[W*0.5/TEX_SCALE,(H+roofH)/TEX_SCALE]], MAT.WALL);
 
     const slopeX = hw + ov;
     const slopeLen = Math.hypot(slopeX, roofH);
-    const lN = [-roofH/slopeLen, slopeX/slopeLen, 0.0];
-    const rN = [ roofH/slopeLen, slopeX/slopeLen, 0.0];
-    const roofDepth = D + 2*ov;
+    const lN = [-roofH / slopeLen, slopeX / slopeLen, 0.0];
+    const rN = [ roofH / slopeLen, slopeX / slopeLen, 0.0];
+    const roofDepth = D + 2 * ov;
+    const sT = slopeLen / TEX_SCALE, dT = roofDepth / TEX_SCALE;
 
-    pushQuad(roof,
-      [-slopeX, H, -hd-ov], [0, H+roofH, -hd-ov], [0, H+roofH, hd+ov], [-slopeX, H, hd+ov],
-      lN,
-      [[0,0],[0,slopeLen/T],[roofDepth/T,slopeLen/T],[roofDepth/T,0]]);
-    pushQuad(roof,
-      [0, H+roofH, -hd-ov], [slopeX, H, -hd-ov], [slopeX, H, hd+ov], [0, H+roofH, hd+ov],
-      rN,
-      [[0,0],[0,slopeLen/T],[roofDepth/T,slopeLen/T],[roofDepth/T,0]]);
+    quad([-slopeX,H,-hd-ov],[0,H+roofH,-hd-ov],[0,H+roofH,hd+ov],[-slopeX,H,hd+ov], lN,
+         [[0,0],[0,sT],[dT,sT],[dT,0]], MAT.ROOF);
+    quad([0,H+roofH,-hd-ov],[slopeX,H,-hd-ov],[slopeX,H,hd+ov],[0,H+roofH,hd+ov], rN,
+         [[0,0],[0,sT],[dT,sT],[dT,0]], MAT.ROOF);
+
+    if (lod) return g;
 
     const eps = 0.02;
-    const winW = 1.4, winH = 1.6;
-    const winYs = [1.9, 4.5];
-    const winXs = [-2.5, 2.5];
+    const winW = P.winW, winH = P.winH, dens = P.windowDensity;
 
-    for (const y of winYs) for (const x of winXs) {
-      const z = -hd - eps;
-      pushQuad(windows,
-        [x-winW/2, y-winH/2, z], [x+winW/2, y-winH/2, z],
-        [x+winW/2, y+winH/2, z], [x-winW/2, y+winH/2, z],
-        [0,0,-1],
-        [[0,0],[1,0],[1,1],[0,1]]);
-    }
-    for (const y of winYs) for (const x of winXs) {
-      const z = hd + eps;
-      pushQuad(windows,
-        [x+winW/2, y-winH/2, z], [x-winW/2, y-winH/2, z],
-        [x-winW/2, y+winH/2, z], [x+winW/2, y+winH/2, z],
-        [0,0,1],
-        [[0,0],[1,0],[1,1],[0,1]]);
-    }
-    for (const y of winYs) {
-      const x = -hw - eps;
-      pushQuad(windows,
-        [x, y-winH/2, winW/2], [x, y-winH/2, -winW/2],
-        [x, y+winH/2, -winW/2], [x, y+winH/2, winW/2],
-        [-1,0,0],
-        [[0,0],[1,0],[1,1],[0,1]]);
-    }
-    for (const y of winYs) {
-      const x = hw + eps;
-      pushQuad(windows,
-        [x, y-winH/2, -winW/2], [x, y-winH/2, winW/2],
-        [x, y+winH/2, winW/2], [x, y+winH/2, -winW/2],
-        [1,0,0],
-        [[0,0],[1,0],[1,1],[0,1]]);
+    const colsZ = Math.max(1, Math.round(W / 3.6));
+    const rowsZ = Math.max(1, Math.round((H - 1.8) / 2.8));
+    const colStepZ = W / colsZ;
+    const rowStepZ = (H - 1.8) / rowsZ;
+    for (const sideZ of [-1, 1]) {
+      const z = sideZ * (hd + eps);
+      for (let ci = 0; ci < colsZ; ci++) {
+        const x = -hw + colStepZ * (ci + 0.5);
+        for (let ri = 0; ri < rowsZ; ri++) {
+          const y = 0.9 + rowStepZ * (ri + 0.5);
+          if (sideZ === -1 && ri === 0 && Math.abs(x) < P.doorW * 0.85) continue;
+          if (Math.random() > dens) continue;
+          quad([x-winW*0.5, y-winH*0.5, z], [x+winW*0.5, y-winH*0.5, z],
+               [x+winW*0.5, y+winH*0.5, z], [x-winW*0.5, y+winH*0.5, z],
+               [0,0,sideZ], [[0,0],[1,0],[1,1],[0,1]], MAT.WINDOW);
+        }
+      }
     }
 
-    const doorW = 1.3, doorH = 2.2;
+    const colsX = Math.max(1, Math.round(D / 3.6));
+    const rowsX = Math.max(1, Math.round((H - 1.8) / 2.8));
+    const colStepX = D / colsX;
+    const rowStepX = (H - 1.8) / rowsX;
+    for (const sideX of [-1, 1]) {
+      const x = sideX * (hw + eps);
+      for (let ci = 0; ci < colsX; ci++) {
+        const z = -hd + colStepX * (ci + 0.5);
+        for (let ri = 0; ri < rowsX; ri++) {
+          const y = 0.9 + rowStepX * (ri + 0.5);
+          if (Math.random() > dens) continue;
+          quad([x, y-winH*0.5, z-winW*0.5], [x, y-winH*0.5, z+winW*0.5],
+               [x, y+winH*0.5, z+winW*0.5], [x, y+winH*0.5, z-winW*0.5],
+               [sideX,0,0], [[0,0],[1,0],[1,1],[0,1]], MAT.WINDOW);
+        }
+      }
+    }
+
     const dz = -hd - eps - 0.004;
-    pushQuad(door,
-      [-doorW/2, 0, dz], [doorW/2, 0, dz],
-      [doorW/2, doorH, dz], [-doorW/2, doorH, dz],
-      [0,0,-1],
-      [[0,0],[1,0],[1,1],[0,1]]);
+    quad([-P.doorW*0.5, 0, dz], [P.doorW*0.5, 0, dz],
+         [P.doorW*0.5, P.doorH, dz], [-P.doorW*0.5, P.doorH, dz],
+         [0,0,-1], [[0,0],[1,0],[1,1],[0,1]], MAT.DOOR);
 
-    return { walls, roof, windows, door };
+    if (P.chimney) {
+      const cx = P.chimneySide * hw * 0.45;
+      const cz = 0;
+      const cw = 0.55 + Math.random() * 0.35;
+      const topY = H + roofH + 0.55 + Math.random() * 0.5;
+      box(cx, (H + topY) * 0.5, cz, cw, topY - H, cw, MAT.WALL);
+    }
+
+    return g;
   }
 
-  function createMesh(group) {
+  function createHouseMesh(g, instBuf) {
     const vao = gl.createVertexArray();
     gl.bindVertexArray(vao);
 
-    const posBuf = gl.createBuffer();
-    gl.bindBuffer(gl.ARRAY_BUFFER, posBuf);
-    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(group.pos), gl.STATIC_DRAW);
+    function attrib(arr, loc, size) {
+      const b = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, b);
+      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(arr), gl.STATIC_DRAW);
+      gl.enableVertexAttribArray(loc);
+      gl.vertexAttribPointer(loc, size, gl.FLOAT, false, 0, 0);
+    }
+    attrib(g.pos, 0, 3);
+    attrib(g.nor, 1, 3);
+    attrib(g.uv,  2, 2);
+    attrib(g.mat, 3, 1);
+
+    gl.bindBuffer(gl.ARRAY_BUFFER, instBuf);
+    gl.enableVertexAttribArray(4);
+    gl.vertexAttribPointer(4, 3, gl.FLOAT, false, 20, 0);
+    gl.vertexAttribDivisor(4, 1);
+    gl.enableVertexAttribArray(5);
+    gl.vertexAttribPointer(5, 2, gl.FLOAT, false, 20, 12);
+    gl.vertexAttribDivisor(5, 1);
+
+    const ib = gl.createBuffer();
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ib);
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array(g.idx), gl.STATIC_DRAW);
+
+    gl.bindVertexArray(null);
+    return { vao, count: g.idx.length };
+  }
+
+  const INSTANCE_CAP = 256;
+
+  function makePrototype(rnd) {
+    const P = {
+      W: 6.0 + rnd() * 5.0,
+      D: 5.0 + rnd() * 4.0,
+      H: 4.4 + rnd() * 3.6,
+      roofH: 1.5 + rnd() * 1.7,
+      ov: 0.30 + rnd() * 0.35,
+      winW: 1.0 + rnd() * 0.7,
+      winH: 1.2 + rnd() * 0.9,
+      doorW: 1.1 + rnd() * 0.5,
+      doorH: 2.0 + rnd() * 0.45,
+      windowDensity: 0.55 + rnd() * 0.40,
+      chimney: rnd() < 0.55,
+      chimneySide: rnd() < 0.5 ? -1 : 1
+    };
+    P.hw = P.W * 0.5;
+    P.hd = P.D * 0.5;
+    P.height = P.H + P.roofH;
+
+    const instBuf = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, instBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, INSTANCE_CAP * 5 * 4, gl.DYNAMIC_DRAW);
+
+    const fullGeo = buildHouseGeometry(P, false);
+    const lodGeo  = buildHouseGeometry(P, true);
+
+    return {
+      P: P,
+      hw: P.hw,
+      hd: P.hd,
+      H: P.H,
+      roofH: P.roofH,
+      height: P.height,
+      instBuf: instBuf,
+      mesh:    createHouseMesh(fullGeo, instBuf),
+      lodMesh: createHouseMesh(lodGeo,  instBuf),
+      mainFull: [],
+      mainLod:  [],
+      shadow:   [],
+      scratch:  new Float32Array(INSTANCE_CAP * 5)
+    };
+  }
+
+  // ============ CPU TERRAIN HEIGHT ============
+  function hashUJS(x) {
+    x = x >>> 0;
+    x ^= x >>> 16;
+    x = Math.imul(x, 0x7feb352d) >>> 0;
+    x ^= x >>> 15;
+    x = Math.imul(x, 0x846ca68b) >>> 0;
+    x ^= x >>> 16;
+    return x >>> 0;
+  }
+  function rand2JS(x, y, seed) {
+    const h = hashUJS(
+      (Math.imul(x, 1597334677) ^ Math.imul(y, 3812015801) ^ Math.imul(seed, 2654435761)) >>> 0
+    );
+    return h / 4294967296;
+  }
+  function noise2JS(x, y, seed) {
+    const ix = Math.floor(x), iy = Math.floor(y);
+    const fx = x - ix, fy = y - iy;
+    const ux = fx * fx * (3 - 2 * fx);
+    const uy = fy * fy * (3 - 2 * fy);
+    const a = rand2JS(ix,     iy,     seed);
+    const b = rand2JS(ix + 1, iy,     seed);
+    const c = rand2JS(ix,     iy + 1, seed);
+    const d = rand2JS(ix + 1, iy + 1, seed);
+    const top = a + (b - a) * ux;
+    const bot = c + (d - c) * ux;
+    return top + (bot - top) * uy;
+  }
+  function terrainHeightJS(x, z) {
+    const sx = (x * TERRAIN.p) / TERRAIN.m;
+    const sz = (z * TERRAIN.p) / TERRAIN.m;
+    const n1 = noise2JS(sx,                   sz,                   TERRAIN.seed);
+    const n2 = noise2JS(sx * 2.7 + 31.4,      sz * 2.7 - 17.2,      TERRAIN.seed + 101);
+    const n3 = noise2JS(sx * 6.1 - 8.8,       sz * 6.1 + 55.5,      TERRAIN.seed + 202);
+    const n4 = noise2JS(sx * 13.3 + 2.2,      sz * 13.3 - 7.7,      TERRAIN.seed + 303);
+    return TERRAIN.k * (n1 * 0.52 + n2 * 0.24 + n3 * 0.14 + n4 * 0.10);
+  }
+
+  // ============ RNG ============
+  function mulberry32(a) {
+    return function() {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      let t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  const rng = mulberry32(20240614);
+
+  // ============ HOUSE PLACEMENT ============
+  const NUM_PROTOTYPES = 7;
+  const prototypes = [];
+  for (let i = 0; i < NUM_PROTOTYPES; i++) prototypes.push(makePrototype(rng));
+
+  function houseBaseHeight(x, z, hw, hd) {
+    let minH = terrainHeightJS(x, z);
+    minH = Math.min(minH, terrainHeightJS(x - hw, z - hd));
+    minH = Math.min(minH, terrainHeightJS(x + hw, z - hd));
+    minH = Math.min(minH, terrainHeightJS(x - hw, z + hd));
+    minH = Math.min(minH, terrainHeightJS(x + hw, z + hd));
+    return minH;
+  }
+
+  function houseSiteRoughness(x, z, hw, hd) {
+    const hs = [
+      terrainHeightJS(x, z),
+      terrainHeightJS(x - hw, z - hd),
+      terrainHeightJS(x + hw, z - hd),
+      terrainHeightJS(x - hw, z + hd),
+      terrainHeightJS(x + hw, z + hd)
+    ];
+    return Math.max.apply(null, hs) - Math.min.apply(null, hs);
+  }
+
+  const houseInstances = [];
+  const placedXZ = [];
+
+  function placeHouse(proto, x, z, rot, scale, force) {
+    const hw = proto.hw * scale;
+    const hd = proto.hd * scale;
+
+    if (!force) {
+      if (houseSiteRoughness(x, z, hw, hd) > 2.2) return false;
+      for (let i = 0; i < placedXZ.length; i++) {
+        const dx = placedXZ[i][0] - x;
+        const dz = placedXZ[i][1] - z;
+        const rr = 30 + Math.max(hw, hd) + placedXZ[i][2];
+        if (dx * dx + dz * dz < rr * rr) return false;
+      }
+    }
+
+    const y = houseBaseHeight(x, z, hw, hd) - 0.35;
+    const totalH = proto.height * scale;
+
+    houseInstances.push({
+      proto: proto,
+      x: x, y: y, z: z,
+      rot: rot,
+      scale: scale,
+      hw: hw,
+      hd: hd,
+      radius: Math.hypot(hw, hd) + totalH,
+      cy: y + totalH * 0.5
+    });
+    placedXZ.push([x, z, Math.max(hw, hd)]);
+    return true;
+  }
+
+  placeHouse(prototypes[0], 1.0, 60.0, 0, 1.0, true);
+  placedXZ.push([0.0, 78.0, 0.0]);
+
+  const NUM_EXTRA    = 100;
+  const PLACE_RADIUS = 360;
+
+  let attempts = 0;
+  while (houseInstances.length < 1 + NUM_EXTRA && attempts < 12000) {
+    attempts++;
+    const ang = rng() * Math.PI * 2;
+    const rad = 45 + rng() * PLACE_RADIUS;
+    const x = Math.cos(ang) * rad;
+    const z = Math.sin(ang) * rad;
+    const proto = prototypes[(rng() * prototypes.length) | 0];
+    const scale = 0.85 + rng() * 0.32;
+    const rot   = rng() * Math.PI * 2;
+    placeHouse(proto, x, z, rot, scale, false);
+  }
+
+  console.log('Houses placed:', houseInstances.length,
+              'across', prototypes.length, 'prototypes after', attempts, 'attempts');
+
+  // ============================================================
+  // ============ THE ENTITY  (tall, thin, all black) ===========
+  // ============================================================
+  function buildEntityForm(rnd) {
+    const pos = [], idx = [], hn = [];
+    const C = [[-1,-1,-1],[1,-1,-1],[1,1,-1],[-1,1,-1],
+               [-1,-1,1],[1,-1,1],[1,1,1],[-1,1,1]];
+    const F = [[0,1,2,3],[5,4,7,6],[4,0,3,7],[1,5,6,2],[3,2,6,7],[4,5,1,0]];
+
+    function box(cx, cy, cz, sx, sy, sz) {
+      const base = pos.length / 3;
+      for (let i = 0; i < 8; i++) {
+        const px = cx + C[i][0] * sx * 0.5;
+        const py = cy + C[i][1] * sy * 0.5;
+        const pz = cz + C[i][2] * sz * 0.5;
+        pos.push(px, py, pz);
+        hn.push(py);
+      }
+      for (let f = 0; f < 6; f++) {
+        const q = F[f];
+        idx.push(base + q[0], base + q[1], base + q[2],
+                 base + q[0], base + q[2], base + q[3]);
+      }
+    }
+
+    // legs
+    const legLen   = 0.70 + rnd() * 1.50;
+    const legThick = 0.080 + rnd() * 0.090;
+    const twoLegs  = rnd() > 0.16;
+    const spread   = 0.07 + rnd() * 0.19;
+    if (twoLegs) {
+      box(-spread, legLen * 0.5, 0, legThick, legLen, legThick);
+      box( spread, legLen * 0.5, 0, legThick, legLen, legThick);
+    } else {
+      box(0, legLen * 0.5, 0, legThick * 1.8, legLen, legThick * 1.8);
+    }
+
+    // torso (1-3 stacked segments)
+    let y = legLen;
+    const segs = 1 + ((rnd() * 3) | 0);
+    const torsoW = 0.22 + rnd() * 0.26;
+    for (let i = 0; i < segs; i++) {
+      const h = 0.18 + rnd() * 0.34;
+      const w = torsoW * (1.0 - i * 0.11);
+      box(0, y + h * 0.5, 0, w, h, w * (0.48 + rnd() * 0.22));
+      y += h;
+    }
+    const shoulderY = y;
+
+    // arms (0-4)
+    const armCount = (rnd() * 5) | 0;
+    const armLen   = 0.55 + rnd() * 1.55;
+    const armThick = 0.060 + rnd() * 0.060;
+    for (let i = 0; i < armCount; i++) {
+      const side = (i % 2 === 0) ? -1 : 1;
+      const tier = Math.floor(i / 2);
+      const off  = side * (torsoW * 0.5 + armThick * 0.7 + tier * 0.10);
+      box(off, shoulderY - armLen * 0.5 + 0.04, 0, armThick, armLen, armThick);
+    }
+
+    // neck / head
+    const neckLen = rnd() * 0.85;
+    const neckW   = 0.075 + rnd() * 0.050;
+    if (neckLen > 0.04) box(0, shoulderY + neckLen * 0.5, 0, neckW, neckLen, neckW);
+
+    const headH   = 0.14 + rnd() * 0.36;
+    const headW   = 0.14 + rnd() * 0.15;
+    const headY   = shoulderY + neckLen;
+    const hasHead = rnd() > 0.06;
+    if (hasHead) box(0, headY + headH * 0.5, 0, headW, headH, headW);
+
+    let totalH = headY + (hasHead ? headH : 0);
+    if (totalH < 0.5) totalH = 0.5;
+
+    const target = 2.45 + rnd() * 1.15;
+    let k = target / totalH;
+    k = Math.max(0.55, Math.min(1.70, k));
+    for (let i = 0; i < pos.length; i++) pos[i] *= k;
+
+    // heightNorm in [0,1]
+    for (let i = 0; i < hn.length; i++) {
+      hn[i] = Math.max(0, Math.min(1, hn[i] / totalH));
+    }
+
+    return { pos: pos, idx: idx, hn: hn, height: totalH * k };
+  }
+
+  function createEntityFormMesh(g) {
+    const vao = gl.createVertexArray();
+    gl.bindVertexArray(vao);
+
+    const vb = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, vb);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(g.pos), gl.STATIC_DRAW);
     gl.enableVertexAttribArray(0);
     gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
 
-    const norBuf = gl.createBuffer();
-    gl.bindBuffer(gl.ARRAY_BUFFER, norBuf);
-    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(group.nor), gl.STATIC_DRAW);
+    const hb = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, hb);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(g.hn), gl.STATIC_DRAW);
     gl.enableVertexAttribArray(1);
-    gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 0, 0);
+    gl.vertexAttribPointer(1, 1, gl.FLOAT, false, 0, 0);
 
-    const uvBuf = gl.createBuffer();
-    gl.bindBuffer(gl.ARRAY_BUFFER, uvBuf);
-    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(group.uv), gl.STATIC_DRAW);
-    gl.enableVertexAttribArray(2);
-    gl.vertexAttribPointer(2, 2, gl.FLOAT, false, 0, 0);
-
-    const idxBuf = gl.createBuffer();
-    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, idxBuf);
-    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array(group.idx), gl.STATIC_DRAW);
+    const ib = gl.createBuffer();
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ib);
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array(g.idx), gl.STATIC_DRAW);
 
     gl.bindVertexArray(null);
-    return { vao, count: group.idx.length };
+    return { vao: vao, count: g.idx.length };
   }
 
-  const houseGeo = buildHouseMeshes();
-  const wallMesh    = createMesh(houseGeo.walls);
-  const roofMesh    = createMesh(houseGeo.roof);
-  const windowMesh  = createMesh(houseGeo.windows);
-  const doorMesh    = createMesh(houseGeo.door);
+  const ENTITY_FORM_COUNT = 14;
+  const entityForms = [];
+  for (let i = 0; i < ENTITY_FORM_COUNT; i++) {
+    const g = buildEntityForm(rng);
+    entityForms.push({
+      mesh:    createEntityFormMesh(g),
+      height:  g.height,
+      scaleXZ: 0.72 + rng() * 0.50,
+      scaleY:  0.85 + rng() * 0.45
+    });
+  }
 
-  const terrainVAO = gl.createVertexArray();
+  const ENT = {
+    MIN_DIST:  62,
+    MAX_DIST:  360,
+    WALL_OFF:  0.55,
+    PEEK_OUT:  2.8,
+    RISE_TIME: 1.8,
+    FALL_TIME: 0.5,
+    HOLD_MIN:  0.4,
+    HOLD_MAX:  2.6,
+    HIDE_MIN:  2.5,
+    HIDE_MAX:  8.0,
+    SPOT_DOT:  0.990,
+    SPOT_TIME: 0.5
+  };
+
+  const entity = {
+    houseIdx: -1,
+    formIdx: 0,
+    state: 'hidden',
+    p: 0,
+    timer: 3.0,
+    axis: 'x',
+    wallSign: 1,
+    tanSign: 1,
+    spotted: 0,
+    matrix: mat4.create(),
+    world: [0, 0, 0],
+
+    // animation state
+    animTime: 0,
+    animSeed: 0,
+    sway: 0.06,
+    swaySpeed: 0.8,
+    breath: 0.4,
+    headTilt: 0.15,
+    shudderTimer: 3,
+    shudderBurst: 0,
+    freezeTimer: 10,
+    freezeDur: 0
+  };
+
+  function entityPickHouse(exclude) {
+    const px = player.pos[0], pz = player.pos[2];
+    const fx = Math.sin(player.yaw), fz = -Math.cos(player.yaw);
+    const minD2 = ENT.MIN_DIST * ENT.MIN_DIST;
+    const maxD2 = ENT.MAX_DIST * ENT.MAX_DIST;
+    const cands = [];
+    for (let i = 0; i < houseInstances.length; i++) {
+      if (i === exclude) continue;
+      const h = houseInstances[i];
+      const dx = h.x - px, dz = h.z - pz;
+      const d2 = dx * dx + dz * dz;
+      if (d2 < minD2 || d2 > maxD2) continue;
+      const d = Math.sqrt(d2);
+      const align = (dx / d) * fx + (dz / d) * fz;
+      cands.push({ i: i, score: align * 2.2 + Math.random() * 1.4 });
+    }
+    if (!cands.length) return false;
+    cands.sort((a, b) => b.score - a.score);
+    const top = Math.min(6, cands.length);
+    entity.houseIdx = cands[(Math.random() * top) | 0].i;
+    return true;
+  }
+
+  function entityPickForm() {
+    if (entityForms.length < 2) return;
+    let f;
+    do { f = (Math.random() * entityForms.length) | 0; }
+    while (f === entity.formIdx);
+    entity.formIdx = f;
+  }
+
+  function entityRelocate() {
+    const old = entity.houseIdx;
+    entity.state = 'hidden';
+    entity.p = 0;
+    entity.spotted = 0;
+    entity.timer = ENT.HIDE_MIN + Math.random() * (ENT.HIDE_MAX - ENT.HIDE_MIN);
+    entityPickForm();
+
+    // fresh motion personality each spawn
+    entity.animTime     = 0;
+    entity.animSeed     = Math.random() * 100;
+    entity.sway         = 0.030 + Math.random() * 0.085;
+    entity.swaySpeed    = 0.30  + Math.random() * 0.70;
+    entity.breath       = 0.20  + Math.random() * 0.60;
+    entity.headTilt     = 0.10  + Math.random() * 0.30;
+    entity.shudderTimer = 4 + Math.random() * 8;
+    entity.shudderBurst = 0;
+    entity.freezeTimer  = 6 + Math.random() * 12;
+    entity.freezeDur    = 0;
+
+    if (!entityPickHouse(old)) entity.houseIdx = -1;
+  }
+
+  function entityStartPeek() {
+    const h = houseInstances[entity.houseIdx];
+    const c = Math.cos(h.rot), s = Math.sin(h.rot);
+    const dx = player.pos[0] - h.x;
+    const dz = player.pos[2] - h.z;
+    const lx = dx * c - dz * s;
+    const lz = dx * s + dz * c;
+    if (Math.abs(lx) > Math.abs(lz)) {
+      entity.axis = 'z';
+      entity.wallSign = lx > 0 ? -1 : 1;
+      entity.tanSign  = lz >= 0 ? 1 : -1;
+    } else {
+      entity.axis = 'x';
+      entity.wallSign = lz > 0 ? -1 : 1;
+      entity.tanSign  = lx >= 0 ? 1 : -1;
+    }
+    entity.state = 'peek';
+    entity.p = 0;
+    entity.timer = ENT.HOLD_MIN + Math.random() * (ENT.HOLD_MAX - ENT.HOLD_MIN);
+    entity.spotted = 0;
+  }
+
+  function updateEntity(dt) {
+    if (houseInstances.length === 0) return;
+
+    if (entity.houseIdx < 0) {
+      entity.timer -= dt;
+      if (entity.timer > 0) return;
+      if (!entityPickHouse(-1)) { entity.timer = 1.5; return; }
+      entity.state = 'hidden';
+      entity.p = 0;
+      entity.timer = ENT.HIDE_MIN + Math.random() * 3.0;
+    }
+
+    const h = houseInstances[entity.houseIdx];
+    const pdx = player.pos[0] - h.x, pdz = player.pos[2] - h.z;
+    if (Math.hypot(pdx, pdz) < ENT.MIN_DIST * 0.85) {
+      entityRelocate();
+      return;
+    }
+
+    if (entity.state === 'hidden') {
+      entity.timer -= dt;
+      if (entity.timer <= 0) entityStartPeek();
+    } else if (entity.state === 'peek') {
+      entity.p += dt / ENT.RISE_TIME;
+      if (entity.p >= 1) { entity.p = 1; entity.state = 'hold'; }
+    } else if (entity.state === 'hold') {
+      entity.timer -= dt;
+      if (entity.timer <= 0) entity.state = 'fall';
+    } else if (entity.state === 'fall') {
+      entity.p -= dt / ENT.FALL_TIME;
+      if (entity.p <= 0) {
+        entity.p = 0;
+        entity.state = 'hidden';
+        entity.timer = ENT.HIDE_MIN + Math.random() * (ENT.HIDE_MAX - ENT.HIDE_MIN);
+      }
+    }
+
+    // ---- animation clock + scares ----
+    entity.freezeTimer -= dt;
+    if (entity.freezeDur > 0) {
+      entity.freezeDur -= dt;
+    } else {
+      if (entity.freezeTimer <= 0) {
+        entity.freezeTimer = 8 + Math.random() * 16;
+        entity.freezeDur    = 1.2 + Math.random() * 3.0;
+      }
+      entity.animTime += dt;
+    }
+    entity.shudderTimer -= dt;
+    if (entity.shudderTimer <= 0) {
+      entity.shudderTimer = 5 + Math.random() * 12;
+      entity.shudderBurst = 1.0;
+    }
+    entity.shudderBurst = Math.max(0, entity.shudderBurst - dt * 0.9);
+
+    // ---- placement ----
+    const c = Math.cos(h.rot), s = Math.sin(h.rot);
+    const hw = h.hw, hd = h.hd;
+    const p = entity.p;
+    let lx, lz;
+    if (entity.axis === 'z') {
+      const span = hd;
+      lx = entity.wallSign * (hw + ENT.WALL_OFF);
+      lz = entity.tanSign * (span * 0.30 + p * (span * 0.70 + ENT.PEEK_OUT));
+    } else {
+      const span = hw;
+      lz = entity.wallSign * (hd + ENT.WALL_OFF);
+      lx = entity.tanSign * (span * 0.30 + p * (span * 0.70 + ENT.PEEK_OUT));
+    }
+    const wx = h.x + lx * c + lz * s;
+    const wz = h.z - lx * s + lz * c;
+    const gy = Math.max(terrainHeightJS(wx, wz), h.y) - 0.25;
+
+    entity.world[0] = wx; entity.world[1] = gy; entity.world[2] = wz;
+
+    // ---- whole-body motion ----
+    const form    = entityForms[entity.formIdx];
+    const faceYaw = Math.atan2(player.pos[0] - wx, player.pos[2] - wz);
+
+    let stateAmp = 1.0;
+    if (entity.state === 'peek')      stateAmp = 0.55;
+    else if (entity.state === 'hold') stateAmp = 1.35;
+    else if (entity.state === 'fall') stateAmp = 1.60;
+
+    const at = entity.animTime;
+    const bobY   = Math.sin(at * 0.30 + entity.animSeed)       * 0.045 * stateAmp;
+    const leanX  = Math.sin(at * 0.42 + entity.animSeed * 1.3) * 0.035 * stateAmp;
+    const leanZ  = Math.cos(at * 0.31 + entity.animSeed * 0.7) * 0.035 * stateAmp;
+    const yawWob = Math.sin(at * 0.24 + entity.animSeed * 0.5) * 0.075 * stateAmp;
+
+    const mm = entity.matrix;
+    mat4.identity(mm);
+    mat4.translate(mm, mm, [wx, gy + bobY, wz]);
+    mat4.rotateY(mm, mm, faceYaw + yawWob);
+    mat4.rotateX(mm, mm, leanX);
+    mat4.rotateZ(mm, mm, leanZ);
+    mat4.scale(mm, mm, [form.scaleXZ, form.scaleY, form.scaleXZ]);
+
+    // ---- did you catch it looking? ----
+    const eyeY = gy + form.height * form.scaleY * 0.85;
+    const ex = wx - player.pos[0];
+    const ey = eyeY - player.pos[1];
+    const ez = wz - player.pos[2];
+    const el = Math.hypot(ex, ey, ez);
+    if (el > 28 && p > 0.55) {
+      const cp = Math.cos(player.pitch);
+      const vfx = Math.sin(player.yaw) * cp;
+      const vfy = Math.sin(player.pitch);
+      const vfz = -Math.cos(player.yaw) * cp;
+      const dot = (ex * vfx + ey * vfy + ez * vfz) / el;
+      if (dot > ENT.SPOT_DOT) {
+        entity.spotted += dt;
+        if (entity.spotted > ENT.SPOT_TIME) { entityRelocate(); return; }
+      } else {
+        entity.spotted = Math.max(0, entity.spotted - dt * 0.7);
+      }
+    } else {
+      entity.spotted = Math.max(0, entity.spotted - dt * 0.7);
+    }
+  }
+
+  function drawEntity() {
+    if (entity.houseIdx < 0) return;
+    const form = entityForms[entity.formIdx];
+    gl.useProgram(entityProg);
+    gl.uniformMatrix4fv(entityU.model,            false, entity.matrix);
+    gl.uniformMatrix4fv(entityU.viewMatrix,       false, viewMatrix);
+    gl.uniformMatrix4fv(entityU.projectionMatrix, false, projectionMatrix);
+    gl.uniform3fv(entityU.cameraWorld,  player.pos);
+    gl.uniform3fv(entityU.horizonColor, HORIZON_COLOR);
+
+    gl.uniform1f(entityU.time,      entity.animTime);
+    gl.uniform1f(entityU.sway,      entity.sway + entity.shudderBurst * 0.18);
+    gl.uniform1f(entityU.swaySpeed, entity.swaySpeed);
+    gl.uniform1f(entityU.breath,    entity.breath);
+    gl.uniform1f(entityU.headTilt,  entity.headTilt + entity.shudderBurst * 0.10);
+    gl.uniform1f(entityU.seed,      entity.animSeed);
+
+    gl.bindVertexArray(form.mesh.vao);
+    gl.drawElements(gl.TRIANGLES, form.mesh.count, gl.UNSIGNED_SHORT, 0);
+  }
 
   // ============ UNIFORM LOOKUPS ============
   const shadowU = {
@@ -1154,14 +1790,12 @@ playNext();
   };
   const houseShadowU = {
     lightViewProj: gl.getUniformLocation(houseShadowProg, 'u_lightViewProj'),
-    model: gl.getUniformLocation(houseShadowProg, 'u_model'),
   };
   const houseU = {
-    model: gl.getUniformLocation(houseProg, 'u_model'),
     viewMatrix: gl.getUniformLocation(houseProg, 'u_viewMatrix'),
     projectionMatrix: gl.getUniformLocation(houseProg, 'u_projectionMatrix'),
     lightViewProj: gl.getUniformLocation(houseProg, 'u_lightViewProj'),
-    texture: gl.getUniformLocation(houseProg, 'u_texture'),
+    texArray: gl.getUniformLocation(houseProg, 'u_texArray'),
     shadowMap: gl.getUniformLocation(houseProg, 'u_shadowMap'),
     sunDir: gl.getUniformLocation(houseProg, 'u_sunDir'),
     sunColor: gl.getUniformLocation(houseProg, 'u_sunColor'),
@@ -1171,7 +1805,6 @@ playNext();
     cameraWorld: gl.getUniformLocation(houseProg, 'u_cameraWorld'),
     shadowBias: gl.getUniformLocation(houseProg, 'u_shadowBias'),
     shadowEnabled: gl.getUniformLocation(houseProg, 'u_shadowEnabled'),
-    texScale: gl.getUniformLocation(houseProg, 'u_texScale'),
   };
   const postU = {
     scene:       gl.getUniformLocation(postProg, 'u_scene'),
@@ -1192,6 +1825,12 @@ playNext();
     projectionMatrix: gl.getUniformLocation(entityProg, 'u_projectionMatrix'),
     cameraWorld:      gl.getUniformLocation(entityProg, 'u_cameraWorld'),
     horizonColor:     gl.getUniformLocation(entityProg, 'u_horizonColor'),
+    time:             gl.getUniformLocation(entityProg, 'u_time'),
+    sway:             gl.getUniformLocation(entityProg, 'u_sway'),
+    swaySpeed:        gl.getUniformLocation(entityProg, 'u_swaySpeed'),
+    breath:           gl.getUniformLocation(entityProg, 'u_breath'),
+    headTilt:         gl.getUniformLocation(entityProg, 'u_headTilt'),
+    seed:             gl.getUniformLocation(entityProg, 'u_seed'),
   };
 
   // ============ CRT TUNING ============
@@ -1242,374 +1881,130 @@ playNext();
     mat4.multiply(lightViewProj, lightProj, lightView);
   }
 
-  // ============ CPU TERRAIN HEIGHT ============
-  function hashUJS(x) {
-    x = x >>> 0;
-    x ^= x >>> 16;
-    x = Math.imul(x, 0x7feb352d) >>> 0;
-    x ^= x >>> 15;
-    x = Math.imul(x, 0x846ca68b) >>> 0;
-    x ^= x >>> 16;
-    return x >>> 0;
-  }
-  function rand2JS(x, y, seed) {
-    const h = hashUJS(
-      (Math.imul(x, 1597334677) ^ Math.imul(y, 3812015801) ^ Math.imul(seed, 2654435761)) >>> 0
-    );
-    return h / 4294967296;
-  }
-  function noise2JS(x, y, seed) {
-    const ix = Math.floor(x), iy = Math.floor(y);
-    const fx = x - ix, fy = y - iy;
-    const ux = fx * fx * (3 - 2 * fx);
-    const uy = fy * fy * (3 - 2 * fy);
-    const a = rand2JS(ix,     iy,     seed);
-    const b = rand2JS(ix + 1, iy,     seed);
-    const c = rand2JS(ix,     iy + 1, seed);
-    const d = rand2JS(ix + 1, iy + 1, seed);
-    const top = a + (b - a) * ux;
-    const bot = c + (d - c) * ux;
-    return top + (bot - top) * uy;
-  }
-  function terrainHeightJS(x, z) {
-    const sx = (x * TERRAIN.p) / TERRAIN.m;
-    const sz = (z * TERRAIN.p) / TERRAIN.m;
-    const n1 = noise2JS(sx,                   sz,                   TERRAIN.seed);
-    const n2 = noise2JS(sx * 2.7 + 31.4,      sz * 2.7 - 17.2,      TERRAIN.seed + 101);
-    const n3 = noise2JS(sx * 6.1 - 8.8,       sz * 6.1 + 55.5,      TERRAIN.seed + 202);
-    const n4 = noise2JS(sx * 13.3 + 2.2,      sz * 13.3 - 7.7,      TERRAIN.seed + 303);
-    return TERRAIN.k * (n1 * 0.52 + n2 * 0.24 + n3 * 0.14 + n4 * 0.10);
-  }
+  // ============ FRUSTUM CULLING ============
+  const frustumPlanes = [
+    [0,0,0,0],[0,0,0,0],[0,0,0,0],[0,0,0,0],[0,0,0,0],[0,0,0,0]
+  ];
 
-  // ============ HOUSE INSTANCES ============
-  function mulberry32(a) {
-    return function() {
-      a |= 0; a = a + 0x6D2B79F5 | 0;
-      let t = Math.imul(a ^ a >>> 15, 1 | a);
-      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
-      return ((t ^ t >>> 14) >>> 0) / 4294967296;
-    };
-  }
-  const rng = mulberry32(20240614);
-
-  function houseBaseHeight(x, z) {
-    const hw = HOUSE.W / 2 + HOUSE.ov;
-    const hd = HOUSE.D / 2 + HOUSE.ov;
-    let minH = terrainHeightJS(x, z);
-    minH = Math.min(minH, terrainHeightJS(x - hw, z - hd));
-    minH = Math.min(minH, terrainHeightJS(x + hw, z - hd));
-    minH = Math.min(minH, terrainHeightJS(x - hw, z + hd));
-    minH = Math.min(minH, terrainHeightJS(x + hw, z + hd));
-    return minH;
-  }
-
-  function houseSiteRoughness(x, z) {
-    const hw = HOUSE.W / 2, hd = HOUSE.D / 2;
-    const hs = [
-      terrainHeightJS(x, z),
-      terrainHeightJS(x - hw, z - hd),
-      terrainHeightJS(x + hw, z - hd),
-      terrainHeightJS(x - hw, z + hd),
-      terrainHeightJS(x + hw, z + hd)
-    ];
-    return Math.max.apply(null, hs) - Math.min.apply(null, hs);
-  }
-
-  function makeHouseMatrix(x, z, rotY) {
-    const m = mat4.create();
-    const y = houseBaseHeight(x, z) - 0.35;
-    mat4.translate(m, m, [x, y, z]);
-    mat4.rotateY(m, m, rotY);
-    return m;
-  }
-
-  const houseInstances = [];
-  const placedXZ = [];
-
-  houseInstances.push(makeHouseMatrix(1.0, 60.0, 0));
-  placedXZ.push([1.0, 60.0]);
-  placedXZ.push([0.0, 78.0]);
-
-  const NUM_EXTRA   = 100;
-  const MIN_DIST    = 36;
-  const PLACE_RADIUS = 360;
-  const MAX_ROUGHNESS = 2.2;
-
-  let attempts = 0;
-  while (houseInstances.length < 1 + NUM_EXTRA && attempts < 8000) {
-    attempts++;
-    const ang = rng() * Math.PI * 2;
-    const rad = 45 + rng() * PLACE_RADIUS;
-    const x = Math.cos(ang) * rad;
-    const z = Math.sin(ang) * rad;
-
-    let tooClose = false;
-    for (let i = 0; i < placedXZ.length; i++) {
-      const dx = placedXZ[i][0] - x;
-      const dz = placedXZ[i][1] - z;
-      if (dx * dx + dz * dz < MIN_DIST * MIN_DIST) { tooClose = true; break; }
+  function extractFrustum(m) {
+    const r0 = [m[0], m[4], m[8],  m[12]];
+    const r1 = [m[1], m[5], m[9],  m[13]];
+    const r2 = [m[2], m[6], m[10], m[14]];
+    const r3 = [m[3], m[7], m[11], m[15]];
+    function setPlane(i, a, b, sign) {
+      const p = frustumPlanes[i];
+      for (let k = 0; k < 4; k++) p[k] = a[k] + sign * b[k];
+      const len = Math.hypot(p[0], p[1], p[2]) || 1;
+      p[0] /= len; p[1] /= len; p[2] /= len; p[3] /= len;
     }
-    if (tooClose) continue;
-    if (houseSiteRoughness(x, z) > MAX_ROUGHNESS) continue;
-
-    const rotY = rng() * Math.PI * 2;
-    houseInstances.push(makeHouseMatrix(x, z, rotY));
-    placedXZ.push([x, z]);
+    setPlane(0, r3, r0,  1);
+    setPlane(1, r3, r0, -1);
+    setPlane(2, r3, r1,  1);
+    setPlane(3, r3, r1, -1);
+    setPlane(4, r3, r2,  1);
+    setPlane(5, r3, r2, -1);
   }
 
-  console.log('Houses placed:', houseInstances.length, 'after', attempts, 'attempts');
-
-  // ============================================================
-  // ============ THE ENTITY  (tall, thin, all black) ===========
-  // ============================================================
-  // A figure that never lets you get a good look at it. It stands
-  // behind a distant house and slowly slides out past a corner —
-  // a sliver of black — and the instant you centre your view on it,
-  // it is gone and standing behind another house somewhere else.
-
-  function buildEntityMesh() {
-    const pos = [], idx = [];
-    const CORNERS = [
-      [-1,-1,-1],[ 1,-1,-1],[ 1, 1,-1],[-1, 1,-1],
-      [-1,-1, 1],[ 1,-1, 1],[ 1, 1, 1],[-1, 1, 1]
-    ];
-    const FACES = [
-      [0,1,2,3],[5,4,7,6],[4,0,3,7],[1,5,6,2],[3,2,6,7],[4,5,1,0]
-    ];
-    function box(cx, cy, cz, sx, sy, sz) {
-      const base = pos.length / 3;
-      for (let i = 0; i < 8; i++) {
-        pos.push(cx + CORNERS[i][0] * sx * 0.5,
-                 cy + CORNERS[i][1] * sy * 0.5,
-                 cz + CORNERS[i][2] * sz * 0.5);
-      }
-      for (let f = 0; f < 6; f++) {
-        const q = FACES[f];
-        idx.push(base + q[0], base + q[1], base + q[2],
-                 base + q[0], base + q[2], base + q[3]);
-      }
+  function sphereInFrustum(x, y, z, r) {
+    for (let i = 0; i < 6; i++) {
+      const p = frustumPlanes[i];
+      if (p[0] * x + p[1] * y + p[2] * z + p[3] < -r) return false;
     }
-    // legs — far too long
-    box(-0.105, 0.80, 0, 0.15, 1.60, 0.15);
-    box( 0.105, 0.80, 0, 0.15, 1.60, 0.15);
-    // pelvis / torso
-    box(0, 1.72, 0, 0.34, 0.28, 0.18);
-    box(0, 2.06, 0, 0.40, 0.46, 0.20);
-    // shoulders
-    box(0, 2.32, 0, 0.58, 0.12, 0.22);
-    // arms — hanging well past the knees
-    box(-0.29, 1.60, 0, 0.095, 1.48, 0.095);
-    box( 0.29, 1.60, 0, 0.095, 1.48, 0.095);
-    // neck
-    box(0, 2.43, 0, 0.11, 0.14, 0.11);
-    // head
-    box(0, 2.64, 0, 0.23, 0.30, 0.23);
-    return { pos, idx };
-  }
-
-  function createEntityMesh() {
-    const g = buildEntityMesh();
-    const vao = gl.createVertexArray();
-    gl.bindVertexArray(vao);
-    const vb = gl.createBuffer();
-    gl.bindBuffer(gl.ARRAY_BUFFER, vb);
-    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(g.pos), gl.STATIC_DRAW);
-    gl.enableVertexAttribArray(0);
-    gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
-    const ib = gl.createBuffer();
-    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ib);
-    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array(g.idx), gl.STATIC_DRAW);
-    gl.bindVertexArray(null);
-    return { vao, count: g.idx.length };
-  }
-  const entityMesh = createEntityMesh();
-
-  const ENT = {
-    MIN_DIST:  62,    // never let the player get closer than this
-    MAX_DIST:  360,   // ...and never spawn it beyond this
-    WALL_OFF:  0.55,  // how far outside the wall it stands
-    PEEK_OUT:  2.8,   // how far past the corner it slides at full peek
-    RISE_TIME: 1.8,   // slow, deliberate creep outward
-    FALL_TIME: 0.5,   // snaps back fast
-    HOLD_MIN:  0.4,
-    HOLD_MAX:  2.6,
-    HIDE_MIN:  2.5,
-    HIDE_MAX:  8.0,
-    SPOT_DOT:  0.990, // ~8 degrees — player looking right at it
-    SPOT_TIME: 0.5    // seconds of eye contact before it vanishes
-  };
-
-  const entity = {
-    houseIdx: -1,
-    state: 'hidden',   // hidden | peek | hold | fall
-    p: 0,              // 0 = tucked behind the house, 1 = fully peeked
-    timer: 3.0,
-    axis: 'x',         // which local axis it slides along
-    wallSign: 1,       // which wall it hides behind
-    tanSign: 1,        // which corner it comes around
-    spotted: 0,
-    matrix: mat4.create(),
-    world: [0, 0, 0]
-  };
-
-  function entityPickHouse(exclude) {
-    const px = player.pos[0], pz = player.pos[2];
-    const fx = Math.sin(player.yaw), fz = -Math.cos(player.yaw);
-    const minD2 = ENT.MIN_DIST * ENT.MIN_DIST;
-    const maxD2 = ENT.MAX_DIST * ENT.MAX_DIST;
-    const cands = [];
-    for (let i = 0; i < houseInstances.length; i++) {
-      if (i === exclude) continue;
-      const m = houseInstances[i];
-      const dx = m[12] - px, dz = m[14] - pz;
-      const d2 = dx * dx + dz * dz;
-      if (d2 < minD2 || d2 > maxD2) continue;
-      const d = Math.sqrt(d2);
-      const align = (dx / d) * fx + (dz / d) * fz;  // 1 = dead ahead
-      cands.push({ i: i, score: align * 2.2 + Math.random() * 1.4 });
-    }
-    if (!cands.length) return false;
-    cands.sort((a, b) => b.score - a.score);
-    const top = Math.min(6, cands.length);
-    entity.houseIdx = cands[(Math.random() * top) | 0].i;
     return true;
   }
 
-  function entityRelocate() {
-    const old = entity.houseIdx;
-    entity.state = 'hidden';
-    entity.p = 0;
-    entity.spotted = 0;
-    entity.timer = ENT.HIDE_MIN + Math.random() * (ENT.HIDE_MAX - ENT.HIDE_MIN);
-    if (!entityPickHouse(old)) entity.houseIdx = -1;
+  // ============ HOUSE DRAW DISTANCES ============
+  const MAIN_CULL_DIST2   = 820 * 820;
+  const LOD_DIST2         = 150 * 150;
+  const SHADOW_CULL_DIST2 = 470 * 470;
+
+  function gatherHouses() {
+    const px = player.pos[0], pz = player.pos[2];
+    for (let i = 0; i < prototypes.length; i++) {
+      const proto = prototypes[i];
+      proto.mainFull.length = 0;
+      proto.mainLod.length = 0;
+      proto.shadow.length = 0;
+    }
+    for (let i = 0; i < houseInstances.length; i++) {
+      const inst = houseInstances[i];
+      const dx = inst.x - px, dz = inst.z - pz;
+      const d2 = dx * dx + dz * dz;
+      if (d2 > MAIN_CULL_DIST2) continue;
+      if (!sphereInFrustum(inst.x, inst.cy, inst.z, inst.radius)) continue;
+
+      const proto = inst.proto;
+      if (d2 < LOD_DIST2) proto.mainFull.push(inst);
+      else                proto.mainLod.push(inst);
+
+      if (d2 < SHADOW_CULL_DIST2) proto.shadow.push(inst);
+    }
   }
 
-  function entityStartPeek() {
-    const m = houseInstances[entity.houseIdx];
-    const c = m[0], s = m[8];
-    const dx = player.pos[0] - m[12];
-    const dz = player.pos[2] - m[14];
-    // player position expressed in the house's local frame
-    const lx = dx * c - dz * s;
-    const lz = dx * s + dz * c;
-    if (Math.abs(lx) > Math.abs(lz)) {
-      // player is mostly to the +/-X side -> hide behind the far X wall,
-      // slide along Z and creep out past the corner nearest the player
-      entity.axis = 'z';
-      entity.wallSign = lx > 0 ? -1 : 1;
-      entity.tanSign  = lz >= 0 ? 1 : -1;
-    } else {
-      entity.axis = 'x';
-      entity.wallSign = lz > 0 ? -1 : 1;
-      entity.tanSign  = lx >= 0 ? 1 : -1;
+  function uploadInstances(proto, list) {
+    const n = Math.min(list.length, INSTANCE_CAP);
+    const a = proto.scratch;
+    for (let i = 0; i < n; i++) {
+      const inst = list[i];
+      const o = i * 5;
+      a[o]     = inst.x;
+      a[o + 1] = inst.y;
+      a[o + 2] = inst.z;
+      a[o + 3] = inst.rot;
+      a[o + 4] = inst.scale;
     }
-    entity.state = 'peek';
-    entity.p = 0;
-    entity.timer = ENT.HOLD_MIN + Math.random() * (ENT.HOLD_MAX - ENT.HOLD_MIN);
-    entity.spotted = 0;
+    gl.bindBuffer(gl.ARRAY_BUFFER, proto.instBuf);
+    gl.bufferSubData(gl.ARRAY_BUFFER, 0, a, 0, n * 5);
+    return n;
   }
 
-  function updateEntity(dt) {
-    if (houseInstances.length === 0) return;
-
-    // no house assigned yet — wait, then claim one
-    if (entity.houseIdx < 0) {
-      entity.timer -= dt;
-      if (entity.timer > 0) return;
-      if (!entityPickHouse(-1)) { entity.timer = 1.5; return; }
-      entity.state = 'hidden';
-      entity.p = 0;
-      entity.timer = ENT.HIDE_MIN + Math.random() * 3.0;
+  function drawHousesShadow() {
+    gl.useProgram(houseShadowProg);
+    gl.uniformMatrix4fv(houseShadowU.lightViewProj, false, lightViewProj);
+    for (let i = 0; i < prototypes.length; i++) {
+      const proto = prototypes[i];
+      if (!proto.shadow.length) continue;
+      const n = uploadInstances(proto, proto.shadow);
+      gl.bindVertexArray(proto.mesh.vao);
+      gl.drawElementsInstanced(gl.TRIANGLES, proto.mesh.count, gl.UNSIGNED_SHORT, 0, n);
     }
+  }
 
-    const m = houseInstances[entity.houseIdx];
-    const hx = m[12], hz = m[14];
-    const pdx = player.pos[0] - hx, pdz = player.pos[2] - hz;
-    if (Math.hypot(pdx, pdz) < ENT.MIN_DIST * 0.85) {
-      entityRelocate();   // too close — gone, somewhere else entirely
-      return;
-    }
+  function drawHousesMain() {
+    gl.useProgram(houseProg);
+    gl.uniformMatrix4fv(houseU.viewMatrix,       false, viewMatrix);
+    gl.uniformMatrix4fv(houseU.projectionMatrix, false, projectionMatrix);
+    gl.uniformMatrix4fv(houseU.lightViewProj,    false, lightViewProj);
+    gl.uniform3fv(houseU.sunDir,      sunDir);
+    gl.uniform3fv(houseU.sunColor,    SUN_COLOR);
+    gl.uniform3fv(houseU.skyColor,    SKY_COLOR);
+    gl.uniform3fv(houseU.groundColor, GROUND_COLOR);
+    gl.uniform3fv(houseU.horizonColor,HORIZON_COLOR);
+    gl.uniform3fv(houseU.cameraWorld, player.pos);
+    gl.uniform1f(houseU.shadowBias, 0.0016);
+    gl.uniform1i(houseU.shadowEnabled, 1);
 
-    // ----- state machine -----
-    if (entity.state === 'hidden') {
-      entity.timer -= dt;
-      if (entity.timer <= 0) entityStartPeek();
-    } else if (entity.state === 'peek') {
-      entity.p += dt / ENT.RISE_TIME;
-      if (entity.p >= 1) { entity.p = 1; entity.state = 'hold'; }
-    } else if (entity.state === 'hold') {
-      entity.timer -= dt;
-      if (entity.timer <= 0) entity.state = 'fall';
-    } else if (entity.state === 'fall') {
-      entity.p -= dt / ENT.FALL_TIME;
-      if (entity.p <= 0) {
-        entity.p = 0;
-        entity.state = 'hidden';
-        entity.timer = ENT.HIDE_MIN + Math.random() * (ENT.HIDE_MAX - ENT.HIDE_MIN);
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, shadowTex);
+    gl.uniform1i(houseU.shadowMap, 1);
+
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D_ARRAY, houseTexArray);
+    gl.uniform1i(houseU.texArray, 0);
+
+    for (let i = 0; i < prototypes.length; i++) {
+      const proto = prototypes[i];
+      if (proto.mainFull.length) {
+        const n = uploadInstances(proto, proto.mainFull);
+        gl.bindVertexArray(proto.mesh.vao);
+        gl.drawElementsInstanced(gl.TRIANGLES, proto.mesh.count, gl.UNSIGNED_SHORT, 0, n);
+      }
+      if (proto.mainLod.length) {
+        const n = uploadInstances(proto, proto.mainLod);
+        gl.bindVertexArray(proto.lodMesh.vao);
+        gl.drawElementsInstanced(gl.TRIANGLES, proto.lodMesh.count, gl.UNSIGNED_SHORT, 0, n);
       }
     }
-
-    // ----- place it around the back of the house -----
-    const c = m[0], s = m[8];
-    const hw = HOUSE.W * 0.5, hd = HOUSE.D * 0.5;
-    const p = entity.p;
-    let lx, lz;
-    if (entity.axis === 'z') {
-      const span = hd;
-      lx = entity.wallSign * (hw + ENT.WALL_OFF);
-      lz = entity.tanSign * (span * 0.30 + p * (span * 0.70 + ENT.PEEK_OUT));
-    } else {
-      const span = hw;
-      lz = entity.wallSign * (hd + ENT.WALL_OFF);
-      lx = entity.tanSign * (span * 0.30 + p * (span * 0.70 + ENT.PEEK_OUT));
-    }
-    const wx = hx + lx * c + lz * s;
-    const wz = hz - lx * s + lz * c;
-    const gy = Math.max(terrainHeightJS(wx, wz), m[13]) - 0.25;
-
-    entity.world[0] = wx; entity.world[1] = gy; entity.world[2] = wz;
-
-    // it always turns to face you
-    const faceYaw = Math.atan2(player.pos[0] - wx, player.pos[2] - wz);
-    const mm = entity.matrix;
-    mat4.identity(mm);
-    mat4.translate(mm, mm, [wx, gy, wz]);
-    mat4.rotateY(mm, mm, faceYaw);
-    mat4.scale(mm, mm, [0.85, 1.15, 0.85]);  // thin it out, stretch it up
-
-    // ----- did you catch it looking? -----
-    const eyeY = gy + 1.75;
-    const ex = wx - player.pos[0];
-    const ey = eyeY - player.pos[1];
-    const ez = wz - player.pos[2];
-    const el = Math.hypot(ex, ey, ez);
-    if (el > 28 && p > 0.55) {
-      const cp = Math.cos(player.pitch);
-      const vfx = Math.sin(player.yaw) * cp;
-      const vfy = Math.sin(player.pitch);
-      const vfz = -Math.cos(player.yaw) * cp;
-      const dot = (ex * vfx + ey * vfy + ez * vfz) / el;
-      if (dot > ENT.SPOT_DOT) {
-        entity.spotted += dt;
-        if (entity.spotted > ENT.SPOT_TIME) { entityRelocate(); return; }
-      } else {
-        entity.spotted = Math.max(0, entity.spotted - dt * 0.7);
-      }
-    } else {
-      entity.spotted = Math.max(0, entity.spotted - dt * 0.7);
-    }
-  }
-
-  function drawEntity() {
-    if (entity.houseIdx < 0) return;
-    gl.useProgram(entityProg);
-    gl.uniformMatrix4fv(entityU.model,            false, entity.matrix);
-    gl.uniformMatrix4fv(entityU.viewMatrix,       false, viewMatrix);
-    gl.uniformMatrix4fv(entityU.projectionMatrix, false, projectionMatrix);
-    gl.uniform3fv(entityU.cameraWorld,  player.pos);
-    gl.uniform3fv(entityU.horizonColor, HORIZON_COLOR);
-    gl.bindVertexArray(entityMesh.vao);
-    gl.drawElements(gl.TRIANGLES, entityMesh.count, gl.UNSIGNED_SHORT, 0);
   }
 
   // ============ INPUT / CONTROLS ============
@@ -1751,59 +2146,7 @@ playNext();
   const HORIZON_COLOR = [0.82, 0.83, 0.74];
   const GROUND_COLOR  = [0.16, 0.20, 0.11];
 
-  // ============ HOUSE DRAW HELPERS ============
-  const houseMeshes = [
-    { mesh: wallMesh,   tex: wallTex   },
-    { mesh: roofMesh,   tex: roofTex   },
-    { mesh: windowMesh, tex: windowTex },
-    { mesh: doorMesh,   tex: doorTex   }
-  ];
-
-  function drawHousesShadow() {
-    gl.useProgram(houseShadowProg);
-    gl.uniformMatrix4fv(houseShadowU.lightViewProj, false, lightViewProj);
-    for (let i = 0; i < houseInstances.length; i++) {
-      gl.uniformMatrix4fv(houseShadowU.model, false, houseInstances[i]);
-      for (let j = 0; j < houseMeshes.length; j++) {
-        const mm = houseMeshes[j].mesh;
-        gl.bindVertexArray(mm.vao);
-        gl.drawElements(gl.TRIANGLES, mm.count, gl.UNSIGNED_SHORT, 0);
-      }
-    }
-  }
-
-  function drawHousesMain() {
-    gl.useProgram(houseProg);
-    gl.uniformMatrix4fv(houseU.viewMatrix,       false, viewMatrix);
-    gl.uniformMatrix4fv(houseU.projectionMatrix, false, projectionMatrix);
-    gl.uniformMatrix4fv(houseU.lightViewProj,    false, lightViewProj);
-    gl.uniform3fv(houseU.sunDir,      sunDir);
-    gl.uniform3fv(houseU.sunColor,    SUN_COLOR);
-    gl.uniform3fv(houseU.skyColor,    SKY_COLOR);
-    gl.uniform3fv(houseU.groundColor, GROUND_COLOR);
-    gl.uniform3fv(houseU.horizonColor,HORIZON_COLOR);
-    gl.uniform3fv(houseU.cameraWorld, player.pos);
-    gl.uniform1f(houseU.shadowBias, 0.0016);
-    gl.uniform1i(houseU.shadowEnabled, 1);
-    gl.uniform1f(houseU.texScale, 1.0);
-
-    gl.activeTexture(gl.TEXTURE1);
-    gl.bindTexture(gl.TEXTURE_2D, shadowTex);
-    gl.uniform1i(houseU.shadowMap, 1);
-
-    gl.activeTexture(gl.TEXTURE0);
-    gl.uniform1i(houseU.texture, 0);
-
-    for (let i = 0; i < houseInstances.length; i++) {
-      gl.uniformMatrix4fv(houseU.model, false, houseInstances[i]);
-      for (let j = 0; j < houseMeshes.length; j++) {
-        const entry = houseMeshes[j];
-        gl.bindTexture(gl.TEXTURE_2D, entry.tex);
-        gl.bindVertexArray(entry.mesh.vao);
-        gl.drawElements(gl.TRIANGLES, entry.mesh.count, gl.UNSIGNED_SHORT, 0);
-      }
-    }
-  }
+  const terrainVAO = gl.createVertexArray();
 
   // ============ MAIN LOOP ============
   let lastTime = performance.now();
@@ -1817,7 +2160,6 @@ playNext();
     lastTime = now;
     const time = (now - startTime) / 1000;
 
-    // ----- movement (fixed axes) -----
     const sprint = !!(keys['ShiftLeft'] || keys['ShiftRight']);
     const speed  = sprint ? SPRINT_SPEED : WALK_SPEED;
 
@@ -1847,7 +2189,6 @@ playNext();
     player.pos[2] = player.target[2];
     player.pos[1] = player.target[1];
 
-    // ----- view / projection -----
     const cp = Math.cos(player.pitch);
     const fwdX = player.pos[0] + Math.sin(player.yaw) * cp;
     const fwdY = player.pos[1] + Math.sin(player.pitch);
@@ -1857,7 +2198,11 @@ playNext();
     mat4.perspective(projectionMatrix, Math.PI / 4, canvas.width / canvas.height, 0.1, 250000);
 
     updateLightMatrices();
-    updateEntity(dt);          // <-- the entity decides what to do this frame
+    updateEntity(dt);
+
+    mat4.multiply(viewProj, projectionMatrix, viewMatrix);
+    extractFrustum(viewProj);
+    gatherHouses();
 
     // ========== SHADOW PASS ==========
     gl.bindFramebuffer(gl.FRAMEBUFFER, shadowFBO);
@@ -1888,8 +2233,6 @@ playNext();
     gl.clearColor(HORIZON_COLOR[0], HORIZON_COLOR[1], HORIZON_COLOR[2], 1.0);
     gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
 
-    // Sky
-    mat4.multiply(viewProj, projectionMatrix, viewMatrix);
     mat4.invert(invViewProj, viewProj);
     gl.disable(gl.DEPTH_TEST);
     gl.depthMask(false);
@@ -1906,7 +2249,6 @@ playNext();
     gl.depthMask(true);
     gl.enable(gl.DEPTH_TEST);
 
-    // Terrain main pass
     gl.disable(gl.CULL_FACE);
     gl.useProgram(mainProg);
     gl.uniformMatrix4fv(mainU.modelViewMatrix,  false, modelViewMatrix);
@@ -1925,12 +2267,6 @@ playNext();
     gl.uniform3fv(mainU.groundColor, GROUND_COLOR);
     gl.uniform3fv(mainU.horizonColor, HORIZON_COLOR);
     gl.uniform3fv(mainU.cameraWorld, player.pos);
-    // NOTE: u_shadowBias deliberately left UNSET on the terrain shader.
-    // With the uniform defaulting to 0.0, the terrain self-shadows into the
-    // stripy / glitchy pattern that the grass texture was tuned against.
-    // (Setting a small bias here — e.g. 0.0018 — produces cleaner, softer
-    // shadows but loses the original glitchy grass-tile look.)
-    gl.uniform1f(mainU.shadowRadius, 2.5);
     gl.uniform1f(mainU.shadowRadius, 1.0);
     gl.uniform1i(mainU.shadowEnabled, 1);
     gl.uniform1f(mainU.grassBump, 0.009);
@@ -1946,9 +2282,8 @@ playNext();
     gl.drawArrays(gl.TRIANGLES, 0, VERTEX_COUNT);
 
     drawHousesMain();
-    drawEntity();               // <-- the black figure
+    drawEntity();
 
-    // ========== RESOLVE MSAA ==========
     if (msaaSamples > 0) {
       gl.bindFramebuffer(gl.READ_FRAMEBUFFER, msaaFBO);
       gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, sceneFBO);
@@ -1985,12 +2320,12 @@ playNext();
     gl.depthMask(true);
     gl.enable(gl.DEPTH_TEST);
 
-    // ----- FPS -----
     frames++;
     if (now - fpsTimer >= 500) {
       const fps = (frames * 1000) / (now - fpsTimer);
       infoEl.textContent =
-        'FPS: ' + fps.toFixed(1) + '  Houses: ' + houseInstances.length + '\n' +
+        'FPS: ' + fps.toFixed(1) + '   Houses: ' + houseInstances.length +
+        '  Prototypes: ' + prototypes.length + '  Forms: ' + entityForms.length + '\n' +
         'WASD / Arrows: move   Shift: sprint\n' +
         'Click: mouse-look (Esc to release)   Drag: look\n' +
         'R: reset view';
@@ -1999,7 +2334,6 @@ playNext();
     }
   }
 
-  // Reset view
   window.addEventListener('keydown', e => {
     if (e.code !== 'KeyR') return;
     player.yaw = 0;
