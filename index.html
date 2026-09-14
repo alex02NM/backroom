@@ -1,0 +1,1869 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Terrain with Shadows — Backrooms Houses</title>
+<style>
+html,body{margin:0;padding:0;overflow:hidden;background:#000}
+canvas{display:block;width:100vw;height:100vh}
+#info{position:fixed;top:8px;left:8px;color:#fff;font:12px monospace;z-index:10;text-shadow:0 1px 2px #000}
+</style>
+</head>
+<body>
+<div id="info">FPS: --</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/gl-matrix/2.4.0/gl-matrix.js"></script>
+<script>
+(function(){
+'use strict';
+
+const canvas=document.createElement('canvas');
+document.body.appendChild(canvas);
+const gl=canvas.getContext('webgl2',{antialias:true});
+if(!gl){
+document.getElementById('info').textContent='WebGL2 not supported.';
+return;
+}
+gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL,true);
+
+const sceneFBO=gl.createFramebuffer();
+const sceneColorTex=gl.createTexture();
+const sceneDepthRB=gl.createRenderbuffer();
+
+let msaaFBO=null,msaaColorRB=null,msaaDepthRB=null;
+let msaaSamples=0;
+let sceneW=1,sceneH=1;
+let currentDpr=1;
+
+function createSceneTargets(w,h){
+if(w<1||h<1)return;
+sceneW=w;sceneH=h;
+
+gl.bindTexture(gl.TEXTURE_2D,sceneColorTex);
+gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA8,w,h,0,gl.RGBA,gl.UNSIGNED_BYTE,null);
+gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
+
+gl.bindRenderbuffer(gl.RENDERBUFFER,sceneDepthRB);
+gl.renderbufferStorage(gl.RENDERBUFFER,gl.DEPTH_COMPONENT24,w,h);
+
+gl.bindFramebuffer(gl.FRAMEBUFFER,sceneFBO);
+gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.TEXTURE_2D,sceneColorTex,0);
+gl.framebufferRenderbuffer(gl.FRAMEBUFFER,gl.DEPTH_ATTACHMENT,gl.RENDERBUFFER,sceneDepthRB);
+
+if(gl.checkFramebufferStatus(gl.FRAMEBUFFER)!==gl.FRAMEBUFFER_COMPLETE)
+console.error('Scene FBO incomplete');
+
+msaaSamples=0;
+const maxSamples=gl.getParameter(gl.MAX_SAMPLES)|0;
+const want=Math.min(4,maxSamples);
+
+if(want>1){
+if(!msaaFBO){
+msaaFBO=gl.createFramebuffer();
+msaaColorRB=gl.createRenderbuffer();
+msaaDepthRB=gl.createRenderbuffer();
+}
+
+gl.bindRenderbuffer(gl.RENDERBUFFER,msaaColorRB);
+gl.renderbufferStorageMultisample(gl.RENDERBUFFER,want,gl.RGBA8,w,h);
+
+gl.bindRenderbuffer(gl.RENDERBUFFER,msaaDepthRB);
+gl.renderbufferStorageMultisample(gl.RENDERBUFFER,want,gl.DEPTH_COMPONENT24,w,h);
+
+gl.bindFramebuffer(gl.FRAMEBUFFER,msaaFBO);
+gl.framebufferRenderbuffer(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.RENDERBUFFER,msaaColorRB);
+gl.framebufferRenderbuffer(gl.FRAMEBUFFER,gl.DEPTH_ATTACHMENT,gl.RENDERBUFFER,msaaDepthRB);
+
+if(gl.checkFramebufferStatus(gl.FRAMEBUFFER)===gl.FRAMEBUFFER_COMPLETE)
+msaaSamples=want;
+}
+
+gl.bindFramebuffer(gl.FRAMEBUFFER,null);
+}
+
+function resize(){
+const dpr=Math.min(window.devicePixelRatio||1,2);
+currentDpr=dpr;
+canvas.width=Math.floor(window.innerWidth*dpr);
+canvas.height=Math.floor(window.innerHeight*dpr);
+canvas.style.width=window.innerWidth+'px';
+canvas.style.height=window.innerHeight+'px';
+createSceneTargets(canvas.width,canvas.height);
+}
+window.addEventListener('resize',resize);
+resize();
+
+function compile(type,source){
+const s=gl.createShader(type);
+gl.shaderSource(s,source);
+gl.compileShader(s);
+if(!gl.getShaderParameter(s,gl.COMPILE_STATUS)){
+const log=gl.getShaderInfoLog(s);
+console.error('Shader compile error:\n'+log);
+source.split('\n').forEach((line,i)=>console.error((i+1)+': '+line));
+throw new Error('Shader compile failed: '+log);
+}
+return s;
+}
+
+function program(vsSrc,fsSrc){
+const vs=compile(gl.VERTEX_SHADER,vsSrc);
+const fs=compile(gl.FRAGMENT_SHADER,fsSrc);
+const p=gl.createProgram();
+gl.attachShader(p,vs);
+gl.attachShader(p,fs);
+gl.linkProgram(p);
+if(!gl.getProgramParameter(p,gl.LINK_STATUS)){
+const log=gl.getProgramInfoLog(p);
+console.error('Program link error:\n'+log);
+throw new Error('Program link failed: '+log);
+}
+gl.deleteShader(vs);
+gl.deleteShader(fs);
+return p;
+}
+
+const TERRAIN={k:38,p:1,m:260,seed:1337,cellSize:4,gridSize:256};
+const VERTEX_COUNT=TERRAIN.gridSize*TERRAIN.gridSize*6;
+const SHADOW_SIZE=2048;
+
+const NOISE_GLSL=`
+uint hashU(uint x){
+x^=x>>16;
+x*=0x7feb352du;
+x^=x>>15;
+x*=0x846ca68bu;
+x^=x>>16;
+return x;
+}
+float rand2(int x,int y,int seed){
+uint h=hashU(uint(x)*1597334677u^uint(y)*3812015801u^uint(seed)*2654435761u);
+return float(h)*(1.0/4294967296.0);
+}
+float noise2(float x,float y,int seed){
+float ix=floor(x),iy=floor(y);
+float fx=x-ix,fy=y-iy;
+float ux=fx*fx*(3.0-2.0*fx);
+float uy=fy*fy*(3.0-2.0*fy);
+float a=rand2(int(ix),int(iy),seed);
+float b=rand2(int(ix)+1,int(iy),seed);
+float c=rand2(int(ix),int(iy)+1,seed);
+float d=rand2(int(ix)+1,int(iy)+1,seed);
+return mix(mix(a,b,ux),mix(c,d,ux),uy);
+}
+float terrainHeight(vec2 pos,float k,float p,float m,int seed){
+vec2 s=pos*p/m;
+float n1=noise2(s.x,s.y,seed);
+float n2=noise2(s.x*2.7+31.4,s.y*2.7-17.2,seed+101);
+float n3=noise2(s.x*6.1-8.8,s.y*6.1+55.5,seed+202);
+float n4=noise2(s.x*13.3+2.2,s.y*13.3-7.7,seed+303);
+return k*(n1*.52+n2*.24+n3*.14+n4*.10);
+}
+`;
+
+const shadowVS=`#version 300 es
+precision highp float;
+precision highp int;
+uniform mat4 u_lightViewProj;
+uniform float u_k,u_p,u_m;
+uniform int u_seed;
+uniform vec2 u_cameraPos;
+uniform float u_cellSize;
+uniform int u_gridSize;
+${NOISE_GLSL}
+void main(){
+int vid=gl_VertexID%6;
+int quadID=gl_VertexID/6;
+int gx=quadID%u_gridSize;
+int gz=quadID/u_gridSize;
+vec2 off;
+if(vid==0)off=vec2(0,0);
+else if(vid==1)off=vec2(1,0);
+else if(vid==2)off=vec2(1,1);
+else if(vid==3)off=vec2(0,0);
+else if(vid==4)off=vec2(1,1);
+else off=vec2(0,1);
+vec2 snapped=floor(u_cameraPos/u_cellSize)*u_cellSize;
+vec2 origin=snapped-.5*float(u_gridSize)*u_cellSize;
+vec2 world=origin+(vec2(float(gx),float(gz))+off)*u_cellSize;
+float h=terrainHeight(world,u_k,u_p,u_m,u_seed);
+vec3 pos=vec3(world.x,h,world.y);
+gl_Position=u_lightViewProj*vec4(pos,1);
+}`;
+
+const shadowFS=`#version 300 es
+precision highp float;
+out vec4 fragColor;
+void main(){fragColor=vec4(1);}
+`;
+
+const mainVS=`#version 300 es
+precision highp float;
+precision highp int;
+uniform mat4 u_modelViewMatrix;
+uniform mat4 u_projectionMatrix;
+uniform mat4 u_lightViewProj;
+uniform float u_k,u_p,u_m;
+uniform int u_seed;
+uniform vec2 u_cameraPos;
+uniform float u_cellSize;
+uniform int u_gridSize;
+out vec3 v_worldPos;
+out vec2 v_uv;
+out vec4 v_lightSpacePos;
+${NOISE_GLSL}
+void main(){
+int vid=gl_VertexID%6;
+int quadID=gl_VertexID/6;
+int gx=quadID%u_gridSize;
+int gz=quadID/u_gridSize;
+vec2 off;
+if(vid==0)off=vec2(0,0);
+else if(vid==1)off=vec2(1,0);
+else if(vid==2)off=vec2(1,1);
+else if(vid==3)off=vec2(0,0);
+else if(vid==4)off=vec2(1,1);
+else off=vec2(0,1);
+vec2 snapped=floor(u_cameraPos/u_cellSize)*u_cellSize;
+vec2 origin=snapped-.5*float(u_gridSize)*u_cellSize;
+vec2 world=origin+(vec2(float(gx),float(gz))+off)*u_cellSize;
+float h=terrainHeight(world,u_k,u_p,u_m,u_seed);
+vec3 pos=vec3(world.x,h,world.y);
+v_uv=world/25.;
+v_worldPos=pos;
+v_lightSpacePos=u_lightViewProj*vec4(pos,1);
+gl_Position=u_projectionMatrix*u_modelViewMatrix*vec4(pos,1);
+}`;
+
+const mainFS=`#version 300 es
+precision highp float;
+precision highp int;
+uniform sampler2D u_texture;
+uniform sampler2D u_shadowMap;
+uniform vec3 u_sunDir;
+uniform vec3 u_sunColor;
+uniform vec3 u_skyColor;
+uniform vec3 u_groundColor;
+uniform vec3 u_horizonColor;
+uniform vec3 u_cameraWorld;
+uniform float u_shadowBias;
+uniform float u_shadowRadius;
+uniform int u_shadowEnabled;
+uniform float u_k;
+uniform float u_grassBump;
+in vec3 v_worldPos;
+in vec2 v_uv;
+in vec4 v_lightSpacePos;
+out vec4 outColor;
+${NOISE_GLSL}
+
+float computeShadow(vec4 lsp,float NdotL){
+if(u_shadowEnabled==0)return 1.;
+vec3 proj=lsp.xyz/lsp.w;
+proj=proj*.5+.5;
+if(proj.x<0.||proj.x>1.||proj.y<0.||proj.y>1.||proj.z>1.)return 1.;
+float bias=max(u_shadowBias*(1.-NdotL),u_shadowBias*.35);
+float shadow=0.;
+vec2 texel=vec2(1./float(${SHADOW_SIZE}));
+for(int x=-1;x<=1;x++){
+for(int y=-1;y<=1;y++){
+float pd=texture(u_shadowMap,proj.xy+vec2(float(x),float(y))*texel*u_shadowRadius).r;
+shadow+=(proj.z-bias>pd)?0.:1.;
+}}
+return shadow/9.;
+}
+
+float grassDetail(vec2 p){
+float n=noise2(p.x*14.,p.y*14.,733)*.50;
+n+=noise2(p.x*38.+5.1,p.y*38.-2.3,811)*.30;
+n+=noise2(p.x*92.-7.7,p.y*92.+3.9,907)*.20;
+return n;
+}
+
+void main(){
+float dcam=distance(v_worldPos,u_cameraWorld);
+float detailFade=1.-smoothstep(25.,115.,dcam);
+
+vec3 N=normalize(cross(dFdx(v_worldPos),dFdy(v_worldPos)));
+if(N.y<0.)N=-N;
+
+vec2 gp=v_worldPos.xz;
+float eps=.05;
+float g0=grassDetail(gp);
+float gx=grassDetail(gp+vec2(eps,0));
+float gz=grassDetail(gp+vec2(0,eps));
+vec2 grad=vec2(gx-g0,gz-g0)/eps;
+vec3 Nf=normalize(N+vec3(-grad.x,0,-grad.y)*u_grassBump*detailFade);
+
+vec3 L=normalize(u_sunDir);
+float NdLgeo=max(dot(N,L),0.);
+float NdL=max(dot(Nf,L),0.);
+float shadow=computeShadow(v_lightSpacePos,NdLgeo);
+
+float heightNorm=clamp(v_worldPos.y/(u_k*.95),0.,1.);
+float slope=clamp(1.-N.y,0.,1.);
+float dryness=clamp(heightNorm*.85+slope*.60,0.,1.);
+
+vec3 lightGreen=vec3(.30,.54,.16);
+vec3 yellowGreen=vec3(.70,.68,.24);
+vec3 grassCol=mix(lightGreen,yellowGreen,dryness);
+
+vec3 texCol=texture(u_texture,v_uv).rgb;
+float texLum=dot(texCol,vec3(.299,.587,.114));
+float texDetail=clamp(texLum*2.7,.35,1.75);
+
+vec3 albedo=grassCol*texDetail;
+albedo*=.88+.26*g0;
+
+vec3 diffuse=u_sunColor*NdL*shadow;
+float skyMix=.5+.5*Nf.y;
+vec3 ambient=mix(u_groundColor,u_skyColor,skyMix)*.62;
+
+vec3 color=albedo*(diffuse+ambient);
+
+float fog=smoothstep(90.,620.,dcam);
+color=mix(color,u_horizonColor,fog);
+
+color=color/(color+vec3(1));
+color=pow(color,vec3(1./2.2));
+outColor=vec4(color,1);
+}
+`;
+
+const skyVS=`#version 300 es
+precision highp float;
+out vec2 v_ndc;
+void main(){
+vec2 p=vec2(float((gl_VertexID<<1)&2),float(gl_VertexID&2));
+v_ndc=p*2.-1.;
+gl_Position=vec4(v_ndc,1,1);
+}
+`;
+
+const skyFS=`#version 300 es
+precision highp float;
+precision highp int;
+uniform mat4 u_invViewProj;
+uniform vec3 u_cameraWorld;
+uniform vec3 u_sunDir;
+uniform vec3 u_sunColor;
+uniform vec3 u_skyColor;
+uniform vec3 u_horizonColor;
+uniform float u_time;
+in vec2 v_ndc;
+out vec4 outColor;
+${NOISE_GLSL}
+
+float fbm(vec2 p,int seed){
+float v=0.;
+float a=.5;
+vec2 q=p;
+for(int i=0;i<6;i++){
+v+=a*noise2(q.x,q.y,seed+i*53);
+q=q*2.07+vec2(3.7,-1.9);
+a*=.5;
+}
+return v;
+}
+
+void main(){
+vec4 clip=vec4(v_ndc,1,1);
+vec4 wp=u_invViewProj*clip;
+vec3 dir=normalize(wp.xyz/wp.w-u_cameraWorld);
+
+float up=clamp(dir.y,-1.,1.);
+float t=pow(clamp(up,0.,1.),.55);
+vec3 sky=mix(u_horizonColor,u_skyColor,t);
+
+float sd=max(dot(dir,u_sunDir),0.);
+float sunDisc=smoothstep(.99965,.99992,sd);
+sky+=u_sunColor*sunDisc*4.;
+sky+=u_sunColor*pow(sd,8.)*.14;
+
+if(dir.y>.012){
+vec2 cp=dir.xz/max(dir.y,.055);
+cp*=.55;
+cp+=vec2(u_time*.0055,u_time*.0021);
+
+float f1=fbm(cp*.55,1200);
+float f2=fbm(cp*1.25+17.,1600);
+float shape=f1*.66+f2*.34;
+
+float cover=.455;
+float c=smoothstep(cover,cover+.20,shape);
+
+float erode=fbm(cp*3.1+41.,2000);
+c*=smoothstep(.30,.78,erode+.22);
+
+float lit=smoothstep(.32,.92,fbm(cp*.95+vec2(.3,.15),2400));
+
+vec3 cloudCol=mix(vec3(.52,.55,.62),vec3(1,.99,.95),lit);
+cloudCol+=u_sunColor*pow(sd,4.)*.30;
+
+float hfade=smoothstep(.012,.22,dir.y);
+sky=mix(sky,cloudCol,clamp(c,0.,1.)*hfade*.94);
+}
+
+outColor=vec4(sky,1);
+}
+`;
+
+const postVS=`#version 300 es
+precision highp float;
+out vec2 v_uv;
+void main(){
+vec2 p=vec2(float((gl_VertexID<<1)&2),float(gl_VertexID&2));
+v_uv=p;
+gl_Position=vec4(p*2.-1.,0,1);
+}
+`;
+
+const postFS=`#version 300 es
+precision highp float;
+precision highp int;
+
+uniform sampler2D u_scene;
+uniform vec2 u_resolution;
+uniform float u_time;
+uniform float u_curvature;
+uniform float u_blur;
+uniform float u_scanline;
+uniform float u_aberration;
+uniform float u_noise;
+uniform float u_vignette;
+uniform float u_flicker;
+uniform float u_mask;
+
+in vec2 v_uv;
+out vec4 outColor;
+
+float hash21(vec2 p){
+p=fract(p*vec2(123.34,456.21));
+p+=dot(p,p+45.32);
+return fract(p.x*p.y);
+}
+
+vec3 blur9(vec2 uv,vec2 texel){
+vec3 s=vec3(0);
+s+=texture(u_scene,uv+vec2(-1,-1)*texel).rgb*.0625;
+s+=texture(u_scene,uv+vec2(0,-1)*texel).rgb*.125;
+s+=texture(u_scene,uv+vec2(1,-1)*texel).rgb*.0625;
+s+=texture(u_scene,uv+vec2(-1,0)*texel).rgb*.125;
+s+=texture(u_scene,uv).rgb*.250;
+s+=texture(u_scene,uv+vec2(1,0)*texel).rgb*.125;
+s+=texture(u_scene,uv+vec2(-1,1)*texel).rgb*.0625;
+s+=texture(u_scene,uv+vec2(0,1)*texel).rgb*.125;
+s+=texture(u_scene,uv+vec2(1,1)*texel).rgb*.0625;
+return s;
+}
+
+void main(){
+vec2 cc=v_uv-.5;
+float r2=dot(cc,cc);
+
+vec2 uv=v_uv+cc*r2*u_curvature;
+
+float left=smoothstep(0.,.012,uv.x);
+float right=1.-smoothstep(.988,1.,uv.x);
+float top=smoothstep(0.,.012,uv.y);
+float bottom=1.-smoothstep(.988,1.,uv.y);
+float edge=left*right*top*bottom;
+
+vec2 uvSafe=clamp(uv,0.,1.);
+vec2 texel=u_blur/u_resolution;
+
+vec2 ca=cc*u_aberration;
+
+vec3 col;
+col.r=blur9(clamp(uvSafe+ca,0.,1.),texel).r;
+col.g=blur9(uvSafe,texel).g;
+col.b=blur9(clamp(uvSafe-ca,0.,1.),texel).b;
+
+vec2 fc=gl_FragCoord.xy;
+
+float scan=0.5+0.5*sin(fc.y*3.14159265);
+float scanStrength=mix(1.,.38+.62*scan,u_scanline);
+col*=scanStrength;
+
+float rgb=mod(floor(fc.x),3.);
+vec3 maskCol;
+
+if(rgb<1.)
+maskCol=vec3(1,.78,.78);
+else if(rgb<2.)
+maskCol=vec3(.78,1,.78);
+else
+maskCol=vec3(.78,.78,1);
+
+col*=mix(vec3(1),maskCol,u_mask);
+
+float scanFine=.5+.5*sin(fc.y*6.2831853);
+col*=.985+.015*scanFine;
+
+float roll=fract(fc.y/max(u_resolution.y,1.)-u_time*.07);
+float bar=smoothstep(0.,.25,roll)*(1.-smoothstep(.25,.55,roll));
+col*=1.+bar*.05;
+
+float n=hash21(fc+fract(u_time*13.)*137.);
+col+=(n-.5)*u_noise;
+
+float flick=sin(u_time*43.)*.6+sin(u_time*17.3)*.4;
+col*=1.+u_flicker*flick;
+
+float vig=clamp(1.-u_vignette*r2*2.2,0.,1.);
+col*=vig;
+
+col*=vec3(1.025,1.,.955);
+
+col=pow(max(col,0.),vec3(.98));
+
+col*=edge;
+
+outColor=vec4(col,1);
+}
+`;
+
+const houseShadowVS=`#version 300 es
+precision highp float;
+layout(location=0)in vec3 a_position;
+uniform mat4 u_lightViewProj;
+uniform mat4 u_model;
+void main(){
+gl_Position=u_lightViewProj*u_model*vec4(a_position,1);
+}
+`;
+
+const houseShadowFS=`#version 300 es
+precision highp float;
+out vec4 fragColor;
+void main(){fragColor=vec4(1);}
+`;
+
+const houseVS=`#version 300 es
+precision highp float;
+layout(location=0)in vec3 a_position;
+layout(location=1)in vec3 a_normal;
+layout(location=2)in vec2 a_uv;
+
+uniform mat4 u_model;
+uniform mat4 u_viewMatrix;
+uniform mat4 u_projectionMatrix;
+uniform mat4 u_lightViewProj;
+
+out vec3 v_worldPos;
+out vec3 v_normal;
+out vec2 v_uv;
+out vec4 v_lightSpacePos;
+
+void main(){
+vec4 wp=u_model*vec4(a_position,1);
+v_worldPos=wp.xyz;
+v_normal=mat3(u_model)*a_normal;
+v_uv=a_uv;
+v_lightSpacePos=u_lightViewProj*wp;
+gl_Position=u_projectionMatrix*u_viewMatrix*wp;
+}
+`;
+
+const houseFS=`#version 300 es
+precision highp float;
+
+uniform sampler2D u_texture;
+uniform sampler2D u_shadowMap;
+uniform vec3 u_sunDir;
+uniform vec3 u_sunColor;
+uniform vec3 u_skyColor;
+uniform vec3 u_groundColor;
+uniform vec3 u_horizonColor;
+uniform vec3 u_cameraWorld;
+uniform float u_shadowBias;
+uniform int u_shadowEnabled;
+uniform float u_texScale;
+
+in vec3 v_worldPos;
+in vec3 v_normal;
+in vec2 v_uv;
+in vec4 v_lightSpacePos;
+out vec4 outColor;
+
+float computeShadow(vec4 lsp,float NdotL){
+if(u_shadowEnabled==0)return 1.;
+vec3 proj=lsp.xyz/lsp.w;
+proj=proj*.5+.5;
+if(proj.x<0.||proj.x>1.||proj.y<0.||proj.y>1.||proj.z>1.)return 1.;
+
+float bias=max(u_shadowBias*(1.-NdotL),u_shadowBias*.35);
+float shadow=0.;
+vec2 texel=vec2(1./float(${SHADOW_SIZE}));
+
+for(int x=-1;x<=1;x++){
+for(int y=-1;y<=1;y++){
+float pd=texture(u_shadowMap,proj.xy+vec2(float(x),float(y))*texel).r;
+shadow+=(proj.z-bias>pd)?0.:1.;
+}}
+
+return shadow/9.;
+}
+
+void main(){
+vec3 albedo=texture(u_texture,v_uv*u_texScale).rgb;
+vec3 N=normalize(v_normal);
+vec3 L=normalize(u_sunDir);
+
+float NdotL=max(dot(N,L),0.);
+float shadow=computeShadow(v_lightSpacePos,NdotL);
+
+vec3 diffuse=u_sunColor*NdotL*shadow;
+float skyMix=.5+.5*N.y;
+vec3 ambient=mix(u_groundColor,u_skyColor,skyMix)*.55;
+
+vec3 color=albedo*(diffuse+ambient);
+
+float dist=distance(v_worldPos,u_cameraWorld);
+float fog=smoothstep(120.,650.,dist);
+color=mix(color,u_horizonColor,fog);
+
+color=color/(color+vec3(1));
+color=pow(color,vec3(1./2.2));
+
+outColor=vec4(color,1);
+}
+`;
+
+let shadowProg,mainProg,skyProg,houseShadowProg,houseProg,postProg;
+
+try{
+shadowProg=program(shadowVS,shadowFS);
+mainProg=program(mainVS,mainFS);
+skyProg=program(skyVS,skyFS);
+houseShadowProg=program(houseShadowVS,houseShadowFS);
+houseProg=program(houseVS,houseFS);
+postProg=program(postVS,postFS);
+}catch(e){
+document.getElementById('info').textContent='Shader error — see console.';
+return;
+}
+
+const shadowTex=gl.createTexture();
+gl.bindTexture(gl.TEXTURE_2D,shadowTex);
+gl.texImage2D(gl.TEXTURE_2D,0,gl.DEPTH_COMPONENT32F,SHADOW_SIZE,SHADOW_SIZE,0,gl.DEPTH_COMPONENT,gl.FLOAT,null);
+gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.NEAREST);
+gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.NEAREST);
+gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
+
+const shadowColorTex=gl.createTexture();
+gl.bindTexture(gl.TEXTURE_2D,shadowColorTex);
+gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA8,SHADOW_SIZE,SHADOW_SIZE,0,gl.RGBA,gl.UNSIGNED_BYTE,null);
+gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.NEAREST);
+gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.NEAREST);
+
+const shadowFBO=gl.createFramebuffer();
+gl.bindFramebuffer(gl.FRAMEBUFFER,shadowFBO);
+gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.TEXTURE_2D,shadowColorTex,0);
+gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.DEPTH_ATTACHMENT,gl.TEXTURE_2D,shadowTex,0);
+
+if(gl.checkFramebufferStatus(gl.FRAMEBUFFER)!==gl.FRAMEBUFFER_COMPLETE)
+console.error('Shadow FBO incomplete');
+
+gl.bindFramebuffer(gl.FRAMEBUFFER,null);
+
+function uploadTexture(canvas,useRepeat){
+const tex=gl.createTexture();
+gl.bindTexture(gl.TEXTURE_2D,tex);
+gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA8,gl.RGBA,gl.UNSIGNED_BYTE,canvas);
+gl.generateMipmap(gl.TEXTURE_2D);
+
+if(useRepeat){
+gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.REPEAT);
+gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.REPEAT);
+}else{
+gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
+}
+
+gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR_MIPMAP_LINEAR);
+gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.LINEAR);
+
+const ext=gl.getExtension('EXT_texture_filter_anisotropic');
+if(ext){
+const maxA=gl.getParameter(ext.MAX_TEXTURE_MAX_ANISOTROPY_EXT);
+gl.texParameterf(gl.TEXTURE_2D,ext.TEXTURE_MAX_ANISOTROPY_EXT,Math.min(8,maxA));
+}
+
+return tex;
+}
+
+function makeGrassTexture(size){
+const c=document.createElement('canvas');
+c.width=c.height=size;
+const ctx=c.getContext('2d');
+
+ctx.fillStyle='#5a6b48';
+ctx.fillRect(0,0,size,size);
+
+for(let i=0;i<180;i++){
+const x=Math.random()*size,y=Math.random()*size;
+const r=30+Math.random()*190;
+const g=ctx.createRadialGradient(x,y,0,x,y,r);
+const bright=Math.random()>.5;
+const col=bright
+?`rgba(${140+Math.random()*60},${165+Math.random()*55},${105+Math.random()*50},.16)`
+:`rgba(${38+Math.random()*30},${52+Math.random()*30},${28+Math.random()*20},.18)`;
+g.addColorStop(0,col);
+g.addColorStop(1,'rgba(0,0,0,0)');
+ctx.fillStyle=g;
+ctx.beginPath();
+ctx.arc(x,y,r,0,Math.PI*2);
+ctx.fill();
+}
+
+for(let i=0;i<40;i++){
+const x=Math.random()*size,y=Math.random()*size;
+const r=15+Math.random()*50;
+const g=ctx.createRadialGradient(x,y,0,x,y,r);
+g.addColorStop(0,'rgba(85,68,42,.30)');
+g.addColorStop(1,'rgba(85,68,42,0)');
+ctx.fillStyle=g;
+ctx.beginPath();
+ctx.arc(x,y,r,0,Math.PI*2);
+ctx.fill();
+}
+
+const img=ctx.getImageData(0,0,size,size);
+const d=img.data;
+
+for(let i=0;i<d.length;i+=4){
+const n=(Math.random()-.5)*42;
+d[i]=Math.max(0,Math.min(255,d[i]+n));
+d[i+1]=Math.max(0,Math.min(255,d[i+1]+n));
+d[i+2]=Math.max(0,Math.min(255,d[i+2]+n));
+}
+
+ctx.putImageData(img,0,0);
+
+for(let i=0;i<42000;i++){
+const x=Math.random()*size,y=Math.random()*size;
+const len=3+Math.random()*14;
+const a=-Math.PI/2+(Math.random()-.5)*1.95;
+const bright=Math.random()<.36;
+
+ctx.strokeStyle=bright
+?`rgba(${150+Math.random()*80},${188+Math.random()*55},${112+Math.random()*55},.30)`
+:`rgba(${34+Math.random()*30},${54+Math.random()*35},${24+Math.random()*20},.34)`;
+
+ctx.lineWidth=.5+Math.random()*.9;
+ctx.beginPath();
+ctx.moveTo(x,y);
+ctx.lineTo(x+Math.cos(a)*len,y+Math.sin(a)*len);
+ctx.stroke();
+}
+
+for(let i=0;i<3000;i++){
+ctx.fillStyle=`rgba(255,255,225,${.03+Math.random()*.09})`;
+ctx.fillRect(Math.random()*size,Math.random()*size,1+Math.random()*2,1+Math.random()*2);
+}
+
+return uploadTexture(c,true);
+}
+
+const grassTex=makeGrassTexture(1024);
+
+function makeWallTexture(size){
+const c=document.createElement('canvas');
+c.width=c.height=size;
+const ctx=c.getContext('2d');
+
+ctx.fillStyle='#f4f2ea';
+ctx.fillRect(0,0,size,size);
+
+const rows=10;
+const boardH=size/rows;
+
+for(let i=0;i<rows;i++){
+const y=i*boardH;
+
+ctx.fillStyle='rgba(90,88,80,.55)';
+ctx.fillRect(0,y+boardH-3,size,3);
+
+ctx.fillStyle='rgba(60,58,52,.75)';
+ctx.fillRect(0,y+boardH-1,size,1);
+
+ctx.fillStyle='rgba(255,255,255,.7)';
+ctx.fillRect(0,y+1,size,1);
+
+const seamX=Math.floor((Math.random()*.5+.25)*size);
+ctx.fillStyle='rgba(120,118,108,.25)';
+ctx.fillRect(seamX,y+2,1,boardH-4);
+}
+
+const img=ctx.getImageData(0,0,size,size);
+const d=img.data;
+
+for(let i=0;i<d.length;i+=4){
+const n=(Math.random()-.5)*10;
+d[i]=Math.max(0,Math.min(255,d[i]+n));
+d[i+1]=Math.max(0,Math.min(255,d[i+1]+n));
+d[i+2]=Math.max(0,Math.min(255,d[i+2]+n));
+}
+
+ctx.putImageData(img,0,0);
+return uploadTexture(c,true);
+}
+
+function makeRoofTexture(size){
+const c=document.createElement('canvas');
+c.width=c.height=size;
+const ctx=c.getContext('2d');
+
+ctx.fillStyle='#2c2c30';
+ctx.fillRect(0,0,size,size);
+
+const cols=14,rows=16;
+const tileW=size/cols;
+const tileH=size/rows;
+
+for(let r=0;r<rows;r++){
+const offset=(r%2)*tileW*.5;
+
+for(let col=-1;col<cols+1;col++){
+const x=col*tileW+offset;
+const y=r*tileH;
+const shade=.55+Math.random()*.55;
+const base=Math.floor(75*shade);
+
+ctx.fillStyle=`rgb(${base},${base},${base+6})`;
+ctx.fillRect(x+.5,y+.5,tileW-1,tileH-1);
+
+ctx.fillStyle='rgba(0,0,0,.45)';
+ctx.fillRect(x+.5,y+tileH-3,tileW-1,2);
+
+for(let k=0;k<4;k++){
+const gx=x+Math.random()*tileW;
+const gy=y+Math.random()*tileH;
+const gs=Math.random()*25+40;
+ctx.fillStyle=`rgba(${gs},${gs},${gs+4},.35)`;
+ctx.fillRect(gx,gy,1,1);
+}
+}
+}
+
+return uploadTexture(c,true);
+}
+
+function makeWindowTexture(size){
+const c=document.createElement('canvas');
+c.width=c.height=size;
+const ctx=c.getContext('2d');
+
+const grad=ctx.createLinearGradient(0,0,0,size);
+grad.addColorStop(0,'#bfdcea');
+grad.addColorStop(.35,'#a8cbe0');
+grad.addColorStop(.70,'#7ea8c7');
+grad.addColorStop(1,'#5b7f9c');
+
+ctx.fillStyle=grad;
+ctx.fillRect(0,0,size,size);
+
+ctx.fillStyle='rgba(40,50,60,.28)';
+ctx.beginPath();
+ctx.moveTo(0,size*.68);
+ctx.bezierCurveTo(size*.3,size*.55,size*.7,size*.78,size,size*.62);
+ctx.lineTo(size,size);
+ctx.lineTo(0,size);
+ctx.closePath();
+ctx.fill();
+
+ctx.strokeStyle='rgba(255,255,255,.45)';
+ctx.lineWidth=size*.03;
+ctx.beginPath();
+ctx.moveTo(size*.10,size*.05);
+ctx.lineTo(size*.45,size*.95);
+ctx.stroke();
+
+ctx.strokeStyle='rgba(255,255,255,.20)';
+ctx.lineWidth=size*.015;
+ctx.beginPath();
+ctx.moveTo(size*.30,size*.05);
+ctx.lineTo(size*.62,size*.95);
+ctx.stroke();
+
+const frameW=size*.09;
+ctx.fillStyle='#f7f5ee';
+ctx.fillRect(0,0,size,frameW);
+ctx.fillRect(0,size-frameW,size,frameW);
+ctx.fillRect(0,0,frameW,size);
+ctx.fillRect(size-frameW,0,frameW,size);
+
+ctx.strokeStyle='rgba(0,0,0,.45)';
+ctx.lineWidth=1.5;
+ctx.strokeRect(frameW,frameW,size-2*frameW,size-2*frameW);
+
+const mullW=size*.045;
+ctx.fillStyle='#f7f5ee';
+ctx.fillRect(size*.5-mullW*.5,frameW,mullW,size-2*frameW);
+ctx.fillRect(frameW,size*.5-mullW*.5,size-2*frameW,mullW);
+
+ctx.fillStyle='rgba(0,0,0,.20)';
+ctx.fillRect(size*.5-mullW*.5+mullW-1,frameW,1,size-2*frameW);
+ctx.fillRect(frameW,size*.5-mullW*.5+mullW-1,size-2*frameW,1);
+
+return uploadTexture(c,false);
+}
+
+function makeDoorTexture(size){
+const c=document.createElement('canvas');
+c.width=size;
+c.height=size*2;
+const ctx=c.getContext('2d');
+
+ctx.fillStyle='#5a3a20';
+ctx.fillRect(0,0,c.width,c.height);
+
+for(let i=0;i<260;i++){
+const x=Math.random()*c.width;
+const shade=.65+Math.random()*.55;
+
+ctx.fillStyle=`rgba(${Math.floor(95*shade)},${Math.floor(62*shade)},${Math.floor(30*shade)},.35)`;
+ctx.fillRect(x,0,1+Math.random()*1.5,c.height);
+}
+
+const mx=c.width*.16;
+const pw=c.width-2*mx;
+const gap=c.height*.055;
+const ph=(c.height-gap*3)/2;
+
+function drawPanel(y,h){
+ctx.strokeStyle='rgba(0,0,0,.7)';
+ctx.lineWidth=4;
+ctx.strokeRect(mx,y,pw,h);
+
+ctx.strokeStyle='rgba(255,255,255,.15)';
+ctx.lineWidth=1.5;
+ctx.strokeRect(mx+3,y+3,pw-6,h-6);
+
+ctx.fillStyle='rgba(0,0,0,.22)';
+ctx.fillRect(mx+2,y+h-6,pw-4,4);
+}
+
+drawPanel(gap,ph);
+drawPanel(gap*2+ph,ph);
+
+ctx.fillStyle='#d4a838';
+ctx.beginPath();
+ctx.arc(c.width*.86,c.height*.54,c.width*.045,0,Math.PI*2);
+ctx.fill();
+
+ctx.fillStyle='rgba(255,255,255,.5)';
+ctx.beginPath();
+ctx.arc(c.width*.855,c.height*.535,c.width*.012,0,Math.PI*2);
+ctx.fill();
+
+return uploadTexture(c,false);
+}
+
+const wallTex=makeWallTexture(512);
+const roofTex=makeRoofTexture(512);
+const windowTex=makeWindowTexture(256);
+const doorTex=makeDoorTexture(256);
+
+const HOUSE={W:8,D:6,H:6.4,roofH:2.4,ov:.4};
+
+function buildHouseMeshes(){
+const W=HOUSE.W,D=HOUSE.D,H=HOUSE.H;
+const roofH=HOUSE.roofH,ov=HOUSE.ov;
+const hw=W/2,hd=D/2;
+const T=2;
+
+const walls={pos:[],nor:[],uv:[],idx:[]};
+const roof={pos:[],nor:[],uv:[],idx:[]};
+const windows={pos:[],nor:[],uv:[],idx:[]};
+const door={pos:[],nor:[],uv:[],idx:[]};
+
+function pushQuad(g,p0,p1,p2,p3,n,uvs){
+const base=g.pos.length/3;
+
+g.pos.push(
+p0[0],p0[1],p0[2],
+p1[0],p1[1],p1[2],
+p2[0],p2[1],p2[2],
+p3[0],p3[1],p3[2]
+);
+
+g.nor.push(
+n[0],n[1],n[2],
+n[0],n[1],n[2],
+n[0],n[1],n[2],
+n[0],n[1],n[2]
+);
+
+g.uv.push(
+uvs[0][0],uvs[0][1],
+uvs[1][0],uvs[1][1],
+uvs[2][0],uvs[2][1],
+uvs[3][0],uvs[3][1]
+);
+
+g.idx.push(base,base+1,base+2,base,base+2,base+3);
+}
+
+function pushTri(g,p0,p1,p2,n,uvs){
+const base=g.pos.length/3;
+
+g.pos.push(
+p0[0],p0[1],p0[2],
+p1[0],p1[1],p1[2],
+p2[0],p2[1],p2[2]
+);
+
+g.nor.push(
+n[0],n[1],n[2],
+n[0],n[1],n[2],
+n[0],n[1],n[2]
+);
+
+g.uv.push(
+uvs[0][0],uvs[0][1],
+uvs[1][0],uvs[1][1],
+uvs[2][0],uvs[2][1]
+);
+
+g.idx.push(base,base+1,base+2);
+}
+
+pushQuad(
+walls,
+[-hw,0,-hd],[hw,0,-hd],[hw,H,-hd],[-hw,H,-hd],
+[0,0,-1],
+[[0,0],[W/T,0],[W/T,H/T],[0,H/T]]
+);
+
+pushQuad(
+walls,
+[hw,0,hd],[-hw,0,hd],[-hw,H,hd],[hw,H,hd],
+[0,0,1],
+[[0,0],[W/T,0],[W/T,H/T],[0,H/T]]
+);
+
+pushQuad(
+walls,
+[-hw,0,hd],[-hw,0,-hd],[-hw,H,-hd],[-hw,H,hd],
+[-1,0,0],
+[[0,0],[D/T,0],[D/T,H/T],[0,H/T]]
+);
+
+pushQuad(
+walls,
+[hw,0,-hd],[hw,0,hd],[hw,H,hd],[hw,H,-hd],
+[1,0,0],
+[[0,0],[D/T,0],[D/T,H/T],[0,H/T]]
+);
+
+pushTri(
+walls,
+[-hw,H,-hd],[hw,H,-hd],[0,H+roofH,-hd],
+[0,0,-1],
+[[0,H/T],[W/T,H/T],[W/2/T,(H+roofH)/T]]
+);
+
+pushTri(
+walls,
+[hw,H,hd],[-hw,H,hd],[0,H+roofH,hd],
+[0,0,1],
+[[0,H/T],[W/T,H/T],[W/2/T,(H+roofH)/T]]
+);
+
+const slopeX=hw+ov;
+const slopeLen=Math.hypot(slopeX,roofH);
+const lN=[-roofH/slopeLen,slopeX/slopeLen,0];
+const rN=[roofH/slopeLen,slopeX/slopeLen,0];
+const roofDepth=D+2*ov;
+
+pushQuad(
+roof,
+[-slopeX,H,-hd-ov],[0,H+roofH,-hd-ov],
+[0,H+roofH,hd+ov],[-slopeX,H,hd+ov],
+lN,
+[[0,0],[0,slopeLen/T],[roofDepth/T,slopeLen/T],[roofDepth/T,0]]
+);
+
+pushQuad(
+roof,
+[0,H+roofH,-hd-ov],[slopeX,H,-hd-ov],
+[slopeX,H,hd+ov],[0,H+roofH,hd+ov],
+rN,
+[[0,0],[0,slopeLen/T],[roofDepth/T,slopeLen/T],[roofDepth/T,0]]
+);
+
+const eps=.02;
+const winW=1.4,winH=1.6;
+const winYs=[1.9,4.5];
+const winXs=[-2.5,2.5];
+
+for(const y of winYs)for(const x of winXs){
+const z=-hd-eps;
+pushQuad(
+windows,
+[x-winW/2,y-winH/2,z],[x+winW/2,y-winH/2,z],
+[x+winW/2,y+winH/2,z],[x-winW/2,y+winH/2,z],
+[0,0,-1],
+[[0,0],[1,0],[1,1],[0,1]]
+);
+}
+
+for(const y of winYs)for(const x of winXs){
+const z=hd+eps;
+pushQuad(
+windows,
+[x+winW/2,y-winH/2,z],[x-winW/2,y-winH/2,z],
+[x-winW/2,y+winH/2,z],[x+winW/2,y+winH/2,z],
+[0,0,1],
+[[0,0],[1,0],[1,1],[0,1]]
+);
+}
+
+for(const y of winYs){
+const x=-hw-eps;
+pushQuad(
+windows,
+[x,y-winH/2,winW/2],[x,y-winH/2,-winW/2],
+[x,y+winH/2,-winW/2],[x,y+winH/2,winW/2],
+[-1,0,0],
+[[0,0],[1,0],[1,1],[0,1]]
+);
+}
+
+for(const y of winYs){
+const x=hw+eps;
+pushQuad(
+windows,
+[x,y-winH/2,-winW/2],[x,y-winH/2,winW/2],
+[x,y+winH/2,winW/2],[x,y+winH/2,-winW/2],
+[1,0,0],
+[[0,0],[1,0],[1,1],[0,1]]
+);
+}
+
+const doorW=1.3,doorH=2.2;
+const dz=-hd-eps-.004;
+
+pushQuad(
+door,
+[-doorW/2,0,dz],[doorW/2,0,dz],
+[doorW/2,doorH,dz],[-doorW/2,doorH,dz],
+[0,0,-1],
+[[0,0],[1,0],[1,1],[0,1]]
+);
+
+return{walls,roof,windows,door};
+}
+
+function createMesh(group){
+const vao=gl.createVertexArray();
+gl.bindVertexArray(vao);
+
+const posBuf=gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER,posBuf);
+gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(group.pos),gl.STATIC_DRAW);
+gl.enableVertexAttribArray(0);
+gl.vertexAttribPointer(0,3,gl.FLOAT,false,0,0);
+
+const norBuf=gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER,norBuf);
+gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(group.nor),gl.STATIC_DRAW);
+gl.enableVertexAttribArray(1);
+gl.vertexAttribPointer(1,3,gl.FLOAT,false,0,0);
+
+const uvBuf=gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER,uvBuf);
+gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(group.uv),gl.STATIC_DRAW);
+gl.enableVertexAttribArray(2);
+gl.vertexAttribPointer(2,2,gl.FLOAT,false,0,0);
+
+const idxBuf=gl.createBuffer();
+gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,idxBuf);
+gl.bufferData(gl.ELEMENT_ARRAY_BUFFER,new Uint16Array(group.idx),gl.STATIC_DRAW);
+
+gl.bindVertexArray(null);
+
+return{vao,count:group.idx.length};
+}
+
+const houseGeo=buildHouseMeshes();
+const wallMesh=createMesh(houseGeo.walls);
+const roofMesh=createMesh(houseGeo.roof);
+const windowMesh=createMesh(houseGeo.windows);
+const doorMesh=createMesh(houseGeo.door);
+
+const terrainVAO=gl.createVertexArray();
+
+const shadowU={
+lightViewProj:gl.getUniformLocation(shadowProg,'u_lightViewProj'),
+k:gl.getUniformLocation(shadowProg,'u_k'),
+p:gl.getUniformLocation(shadowProg,'u_p'),
+m:gl.getUniformLocation(shadowProg,'u_m'),
+seed:gl.getUniformLocation(shadowProg,'u_seed'),
+cameraPos:gl.getUniformLocation(shadowProg,'u_cameraPos'),
+cellSize:gl.getUniformLocation(shadowProg,'u_cellSize'),
+gridSize:gl.getUniformLocation(shadowProg,'u_gridSize')
+};
+
+const mainU={
+modelViewMatrix:gl.getUniformLocation(mainProg,'u_modelViewMatrix'),
+projectionMatrix:gl.getUniformLocation(mainProg,'u_projectionMatrix'),
+lightViewProj:gl.getUniformLocation(mainProg,'u_lightViewProj'),
+k:gl.getUniformLocation(mainProg,'u_k'),
+p:gl.getUniformLocation(mainProg,'u_p'),
+m:gl.getUniformLocation(mainProg,'u_m'),
+seed:gl.getUniformLocation(mainProg,'u_seed'),
+cameraPos:gl.getUniformLocation(mainProg,'u_cameraPos'),
+cellSize:gl.getUniformLocation(mainProg,'u_cellSize'),
+gridSize:gl.getUniformLocation(mainProg,'u_gridSize'),
+texture:gl.getUniformLocation(mainProg,'u_texture'),
+shadowMap:gl.getUniformLocation(mainProg,'u_shadowMap'),
+sunDir:gl.getUniformLocation(mainProg,'u_sunDir'),
+sunColor:gl.getUniformLocation(mainProg,'u_sunColor'),
+skyColor:gl.getUniformLocation(mainProg,'u_skyColor'),
+groundColor:gl.getUniformLocation(mainProg,'u_groundColor'),
+horizonColor:gl.getUniformLocation(mainProg,'u_horizonColor'),
+cameraWorld:gl.getUniformLocation(mainProg,'u_cameraWorld'),
+shadowBias:gl.getUniformLocation(mainProg,'u_shadowBias'),
+shadowRadius:gl.getUniformLocation(mainProg,'u_shadowRadius'),
+shadowEnabled:gl.getUniformLocation(mainProg,'u_shadowEnabled'),
+grassBump:gl.getUniformLocation(mainProg,'u_grassBump')
+};
+
+const skyU={
+invViewProj:gl.getUniformLocation(skyProg,'u_invViewProj'),
+cameraWorld:gl.getUniformLocation(skyProg,'u_cameraWorld'),
+sunDir:gl.getUniformLocation(skyProg,'u_sunDir'),
+sunColor:gl.getUniformLocation(skyProg,'u_sunColor'),
+skyColor:gl.getUniformLocation(skyProg,'u_skyColor'),
+horizonColor:gl.getUniformLocation(skyProg,'u_horizonColor'),
+time:gl.getUniformLocation(skyProg,'u_time')
+};
+
+const houseShadowU={
+lightViewProj:gl.getUniformLocation(houseShadowProg,'u_lightViewProj'),
+model:gl.getUniformLocation(houseShadowProg,'u_model')
+};
+
+const houseU={
+model:gl.getUniformLocation(houseProg,'u_model'),
+viewMatrix:gl.getUniformLocation(houseProg,'u_viewMatrix'),
+projectionMatrix:gl.getUniformLocation(houseProg,'u_projectionMatrix'),
+lightViewProj:gl.getUniformLocation(houseProg,'u_lightViewProj'),
+texture:gl.getUniformLocation(houseProg,'u_texture'),
+shadowMap:gl.getUniformLocation(houseProg,'u_shadowMap'),
+sunDir:gl.getUniformLocation(houseProg,'u_sunDir'),
+sunColor:gl.getUniformLocation(houseProg,'u_sunColor'),
+skyColor:gl.getUniformLocation(houseProg,'u_skyColor'),
+groundColor:gl.getUniformLocation(houseProg,'u_groundColor'),
+horizonColor:gl.getUniformLocation(houseProg,'u_horizonColor'),
+cameraWorld:gl.getUniformLocation(houseProg,'u_cameraWorld'),
+shadowBias:gl.getUniformLocation(houseProg,'u_shadowBias'),
+shadowEnabled:gl.getUniformLocation(houseProg,'u_shadowEnabled'),
+texScale:gl.getUniformLocation(houseProg,'u_texScale')
+};
+
+const postU={
+scene:gl.getUniformLocation(postProg,'u_scene'),
+resolution:gl.getUniformLocation(postProg,'u_resolution'),
+time:gl.getUniformLocation(postProg,'u_time'),
+curvature:gl.getUniformLocation(postProg,'u_curvature'),
+blur:gl.getUniformLocation(postProg,'u_blur'),
+scanline:gl.getUniformLocation(postProg,'u_scanline'),
+aberration:gl.getUniformLocation(postProg,'u_aberration'),
+noise:gl.getUniformLocation(postProg,'u_noise'),
+vignette:gl.getUniformLocation(postProg,'u_vignette'),
+flicker:gl.getUniformLocation(postProg,'u_flicker'),
+mask:gl.getUniformLocation(postProg,'u_mask')
+};
+
+const CRT={
+curvature:.16,
+blur:2.2,
+scanline:.38,
+aberration:.0018,
+noise:.028,
+vignette:.58,
+flicker:.009,
+mask:.22
+};
+
+const player={
+pos:[0,0,78],
+target:[0,0,78],
+yaw:0,
+pitch:-.05,
+eye:2.7
+};
+
+const projectionMatrix=mat4.create();
+const viewMatrix=mat4.create();
+const modelViewMatrix=mat4.create();
+const lightView=mat4.create();
+const lightProj=mat4.create();
+const lightViewProj=mat4.create();
+const viewProj=mat4.create();
+const invViewProj=mat4.create();
+
+const sunDir=vec3.normalize([],[.55,.30,-.35]);
+const LIGHT_DIST=800;
+const LIGHT_ORTHO=450;
+const lightEye=[0,0,0];
+const lightTarget=[0,0,0];
+
+function updateLightMatrices(){
+lightEye[0]=player.pos[0]+sunDir[0]*LIGHT_DIST;
+lightEye[1]=player.pos[1]+sunDir[1]*LIGHT_DIST;
+lightEye[2]=player.pos[2]+sunDir[2]*LIGHT_DIST;
+
+lightTarget[0]=player.pos[0];
+lightTarget[1]=player.pos[1];
+lightTarget[2]=player.pos[2];
+
+mat4.lookAt(lightView,lightEye,lightTarget,[0,1,0]);
+mat4.ortho(lightProj,-LIGHT_ORTHO,LIGHT_ORTHO,-LIGHT_ORTHO,LIGHT_ORTHO,1,LIGHT_DIST*2);
+mat4.multiply(lightViewProj,lightProj,lightView);
+}
+
+function hashUJS(x){
+x=x>>>0;
+x^=x>>>16;
+x=Math.imul(x,0x7feb352d)>>>0;
+x^=x>>>15;
+x=Math.imul(x,0x846ca68b)>>>0;
+x^=x>>>16;
+return x>>>0;
+}
+
+function rand2JS(x,y,seed){
+const h=hashUJS(
+(Math.imul(x,1597334677)^
+Math.imul(y,3812015801)^
+Math.imul(seed,2654435761))>>>0
+);
+return h/4294967296;
+}
+
+function noise2JS(x,y,seed){
+const ix=Math.floor(x),iy=Math.floor(y);
+const fx=x-ix,fy=y-iy;
+const ux=fx*fx*(3-2*fx);
+const uy=fy*fy*(3-2*fy);
+
+const a=rand2JS(ix,iy,seed);
+const b=rand2JS(ix+1,iy,seed);
+const c=rand2JS(ix,iy+1,seed);
+const d=rand2JS(ix+1,iy+1,seed);
+
+const top=a+(b-a)*ux;
+const bot=c+(d-c)*ux;
+
+return top+(bot-top)*uy;
+}
+
+function terrainHeightJS(x,z){
+const sx=x*TERRAIN.p/TERRAIN.m;
+const sz=z*TERRAIN.p/TERRAIN.m;
+
+const n1=noise2JS(sx,sz,TERRAIN.seed);
+const n2=noise2JS(sx*2.7+31.4,sz*2.7-17.2,TERRAIN.seed+101);
+const n3=noise2JS(sx*6.1-8.8,sz*6.1+55.5,TERRAIN.seed+202);
+const n4=noise2JS(sx*13.3+2.2,sz*13.3-7.7,TERRAIN.seed+303);
+
+return TERRAIN.k*(n1*.52+n2*.24+n3*.14+n4*.10);
+}
+
+function mulberry32(a){
+return function(){
+a|=0;
+a=a+0x6D2B79F5|0;
+let t=Math.imul(a^a>>>15,1|a);
+t=t+Math.imul(t^t>>>7,61|t)^t;
+return((t^t>>>14)>>>0)/4294967296;
+};
+}
+
+const rng=mulberry32(20240614);
+
+function houseBaseHeight(x,z){
+const hw=HOUSE.W/2+HOUSE.ov;
+const hd=HOUSE.D/2+HOUSE.ov;
+
+let minH=terrainHeightJS(x,z);
+
+minH=Math.min(minH,terrainHeightJS(x-hw,z-hd));
+minH=Math.min(minH,terrainHeightJS(x+hw,z-hd));
+minH=Math.min(minH,terrainHeightJS(x-hw,z+hd));
+minH=Math.min(minH,terrainHeightJS(x+hw,z+hd));
+
+return minH;
+}
+
+function houseSiteRoughness(x,z){
+const hw=HOUSE.W/2;
+const hd=HOUSE.D/2;
+
+const hs=[
+terrainHeightJS(x,z),
+terrainHeightJS(x-hw,z-hd),
+terrainHeightJS(x+hw,z-hd),
+terrainHeightJS(x-hw,z+hd),
+terrainHeightJS(x+hw,z+hd)
+];
+
+return Math.max.apply(null,hs)-Math.min.apply(null,hs);
+}
+
+function makeHouseMatrix(x,z,rotY){
+const m=mat4.create();
+const y=houseBaseHeight(x,z)-.35;
+
+mat4.translate(m,m,[x,y,z]);
+mat4.rotateY(m,m,rotY);
+
+return m;
+}
+
+const houseInstances=[];
+const placedXZ=[];
+
+houseInstances.push(makeHouseMatrix(1,60,0));
+placedXZ.push([1,60]);
+placedXZ.push([0,78]);
+
+const NUM_EXTRA=100;
+const MIN_DIST=36;
+const PLACE_RADIUS=360;
+const MAX_ROUGHNESS=2.2;
+
+let attempts=0;
+
+while(houseInstances.length<1+NUM_EXTRA&&attempts<8000){
+attempts++;
+
+const ang=rng()*Math.PI*2;
+const rad=45+rng()*PLACE_RADIUS;
+
+const x=Math.cos(ang)*rad;
+const z=Math.sin(ang)*rad;
+
+let tooClose=false;
+
+for(let i=0;i<placedXZ.length;i++){
+const dx=placedXZ[i][0]-x;
+const dz=placedXZ[i][1]-z;
+
+if(dx*dx+dz*dz<MIN_DIST*MIN_DIST){
+tooClose=true;
+break;
+}
+}
+
+if(tooClose)continue;
+if(houseSiteRoughness(x,z)>MAX_ROUGHNESS)continue;
+
+const rotY=rng()*Math.PI*2;
+
+houseInstances.push(makeHouseMatrix(x,z,rotY));
+placedXZ.push([x,z]);
+}
+
+console.log('Houses placed:',houseInstances.length,'after',attempts,'attempts');
+
+const keys=Object.create(null);
+
+window.addEventListener('keydown',e=>{
+keys[e.code]=true;
+
+if(['Space','ArrowUp','ArrowDown','ArrowLeft','ArrowRight'].includes(e.code))
+e.preventDefault();
+});
+
+window.addEventListener('keyup',e=>{
+keys[e.code]=false;
+});
+
+let dragging=false,lastX=0,lastY=0;
+
+canvas.addEventListener('mousedown',e=>{
+dragging=true;
+lastX=e.clientX;
+lastY=e.clientY;
+});
+
+window.addEventListener('mouseup',()=>{
+dragging=false;
+});
+
+window.addEventListener('mousemove',e=>{
+if(!dragging)return;
+
+const dx=e.clientX-lastX;
+const dy=e.clientY-lastY;
+
+lastX=e.clientX;
+lastY=e.clientY;
+
+player.yaw-=dx*.0032;
+player.pitch-=dy*.0032;
+
+player.pitch=Math.max(-1.45,Math.min(1.45,player.pitch));
+});
+
+const infoEl=document.getElementById('info');
+let frames=0;
+let fpsTimer=performance.now();
+
+const SUN_COLOR=[1,.94,.80];
+const SKY_COLOR=[.36,.56,.86];
+const HORIZON_COLOR=[.82,.83,.74];
+const GROUND_COLOR=[.16,.20,.11];
+
+const houseMeshes=[
+{mesh:wallMesh,tex:wallTex},
+{mesh:roofMesh,tex:roofTex},
+{mesh:windowMesh,tex:windowTex},
+{mesh:doorMesh,tex:doorTex}
+];
+
+function drawHousesShadow(){
+gl.useProgram(houseShadowProg);
+gl.uniformMatrix4fv(houseShadowU.lightViewProj,false,lightViewProj);
+
+for(let i=0;i<houseInstances.length;i++){
+gl.uniformMatrix4fv(houseShadowU.model,false,houseInstances[i]);
+
+for(let j=0;j<houseMeshes.length;j++){
+const mm=houseMeshes[j].mesh;
+
+gl.bindVertexArray(mm.vao);
+gl.drawElements(gl.TRIANGLES,mm.count,gl.UNSIGNED_SHORT,0);
+}
+}
+}
+
+function drawHousesMain(){
+gl.useProgram(houseProg);
+
+gl.uniformMatrix4fv(houseU.viewMatrix,false,viewMatrix);
+gl.uniformMatrix4fv(houseU.projectionMatrix,false,projectionMatrix);
+gl.uniformMatrix4fv(houseU.lightViewProj,false,lightViewProj);
+
+gl.uniform3fv(houseU.sunDir,sunDir);
+gl.uniform3fv(houseU.sunColor,SUN_COLOR);
+gl.uniform3fv(houseU.skyColor,SKY_COLOR);
+gl.uniform3fv(houseU.groundColor,GROUND_COLOR);
+gl.uniform3fv(houseU.horizonColor,HORIZON_COLOR);
+gl.uniform3fv(houseU.cameraWorld,player.pos);
+
+gl.uniform1f(houseU.shadowBias,.0016);
+gl.uniform1i(houseU.shadowEnabled,1);
+gl.uniform1f(houseU.texScale,1);
+
+gl.activeTexture(gl.TEXTURE1);
+gl.bindTexture(gl.TEXTURE_2D,shadowTex);
+gl.uniform1i(houseU.shadowMap,1);
+
+gl.activeTexture(gl.TEXTURE0);
+gl.uniform1i(houseU.texture,0);
+
+for(let i=0;i<houseInstances.length;i++){
+gl.uniformMatrix4fv(houseU.model,false,houseInstances[i]);
+
+for(let j=0;j<houseMeshes.length;j++){
+const entry=houseMeshes[j];
+
+gl.bindTexture(gl.TEXTURE_2D,entry.tex);
+gl.bindVertexArray(entry.mesh.vao);
+gl.drawElements(gl.TRIANGLES,entry.mesh.count,gl.UNSIGNED_SHORT,0);
+}
+}
+}
+
+let lastTime=performance.now();
+const startTime=performance.now();
+
+function renderScene(time){
+
+const renderFBO=msaaSamples>1?msaaFBO:sceneFBO;
+
+gl.bindFramebuffer(gl.FRAMEBUFFER,renderFBO);
+gl.viewport(0,0,canvas.width,canvas.height);
+
+gl.clearColor(
+HORIZON_COLOR[0],
+HORIZON_COLOR[1],
+HORIZON_COLOR[2],
+1
+);
+
+gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);
+
+gl.enable(gl.DEPTH_TEST);
+gl.depthFunc(gl.LEQUAL);
+
+gl.disable(gl.CULL_FACE);
+
+mat4.multiply(viewProj,projectionMatrix,viewMatrix);
+mat4.invert(invViewProj,viewProj);
+
+gl.disable(gl.DEPTH_TEST);
+gl.depthMask(false);
+
+gl.useProgram(skyProg);
+
+gl.uniformMatrix4fv(skyU.invViewProj,false,invViewProj);
+gl.uniform3fv(skyU.cameraWorld,player.pos);
+gl.uniform3fv(skyU.sunDir,sunDir);
+gl.uniform3fv(skyU.sunColor,SUN_COLOR);
+gl.uniform3fv(skyU.skyColor,SKY_COLOR);
+gl.uniform3fv(skyU.horizonColor,HORIZON_COLOR);
+gl.uniform1f(skyU.time,time);
+
+gl.bindVertexArray(null);
+gl.drawArrays(gl.TRIANGLES,0,3);
+
+gl.depthMask(true);
+gl.enable(gl.DEPTH_TEST);
+
+gl.useProgram(mainProg);
+
+gl.uniformMatrix4fv(mainU.modelViewMatrix,false,modelViewMatrix);
+gl.uniformMatrix4fv(mainU.projectionMatrix,false,projectionMatrix);
+gl.uniformMatrix4fv(mainU.lightViewProj,false,lightViewProj);
+
+gl.uniform1f(mainU.k,TERRAIN.k);
+gl.uniform1f(mainU.p,TERRAIN.p);
+gl.uniform1f(mainU.m,TERRAIN.m);
+gl.uniform1i(mainU.seed,TERRAIN.seed);
+
+gl.uniform2f(mainU.cameraPos,player.pos[0],player.pos[2]);
+
+gl.uniform1f(mainU.cellSize,TERRAIN.cellSize);
+gl.uniform1i(mainU.gridSize,TERRAIN.gridSize);
+
+gl.uniform3fv(mainU.sunDir,sunDir);
+gl.uniform3fv(mainU.sunColor,SUN_COLOR);
+gl.uniform3fv(mainU.skyColor,SKY_COLOR);
+gl.uniform3fv(mainU.groundColor,GROUND_COLOR);
+gl.uniform3fv(mainU.horizonColor,HORIZON_COLOR);
+gl.uniform3fv(mainU.cameraWorld,player.pos);
+
+gl.uniform1f(mainU.shadowBias,.002);
+gl.uniform1f(mainU.shadowRadius,1.0);
+gl.uniform1i(mainU.shadowEnabled,1);
+gl.uniform1f(mainU.grassBump,.009);
+
+gl.activeTexture(gl.TEXTURE0);
+gl.bindTexture(gl.TEXTURE_2D,grassTex);
+gl.uniform1i(mainU.texture,0);
+
+gl.activeTexture(gl.TEXTURE1);
+gl.bindTexture(gl.TEXTURE_2D,shadowTex);
+gl.uniform1i(mainU.shadowMap,1);
+
+gl.bindVertexArray(terrainVAO);
+gl.drawArrays(gl.TRIANGLES,0,VERTEX_COUNT);
+
+drawHousesMain();
+
+if(msaaSamples>1){
+gl.bindFramebuffer(gl.READ_FRAMEBUFFER,msaaFBO);
+gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER,sceneFBO);
+
+gl.blitFramebuffer(
+0,0,canvas.width,canvas.height,
+0,0,canvas.width,canvas.height,
+gl.COLOR_BUFFER_BIT,
+gl.NEAREST
+);
+}
+}
+
+function renderCRT(time){
+gl.bindFramebuffer(gl.FRAMEBUFFER,null);
+gl.viewport(0,0,canvas.width,canvas.height);
+
+gl.disable(gl.DEPTH_TEST);
+gl.depthMask(false);
+
+gl.clearColor(0,0,0,1);
+gl.clear(gl.COLOR_BUFFER_BIT);
+
+gl.useProgram(postProg);
+
+gl.activeTexture(gl.TEXTURE0);
+gl.bindTexture(gl.TEXTURE_2D,sceneColorTex);
+gl.uniform1i(postU.scene,0);
+
+gl.uniform2f(postU.resolution,canvas.width,canvas.height);
+gl.uniform1f(postU.time,time);
+
+gl.uniform1f(postU.curvature,CRT.curvature);
+gl.uniform1f(postU.blur,CRT.blur);
+gl.uniform1f(postU.scanline,CRT.scanline);
+gl.uniform1f(postU.aberration,CRT.aberration);
+gl.uniform1f(postU.noise,CRT.noise);
+gl.uniform1f(postU.vignette,CRT.vignette);
+gl.uniform1f(postU.flicker,CRT.flicker);
+gl.uniform1f(postU.mask,CRT.mask);
+
+gl.bindVertexArray(null);
+gl.drawArrays(gl.TRIANGLES,0,3);
+
+gl.depthMask(true);
+}
+
+function frame(now){
+requestAnimationFrame(frame);
+
+const dt=Math.min((now-lastTime)/1000,.1);
+lastTime=now;
+
+const time=(now-startTime)/1000;
+
+const sprint=keys['ShiftLeft']||keys['ShiftRight'];
+const speed=sprint?90:28;
+
+let f=0,r=0;
+
+if(keys['KeyW']||keys['ArrowUp'])f+=1;
+if(keys['KeyS']||keys['ArrowDown'])f-=1;
+if(keys['KeyD']||keys['ArrowRight'])r+=1;
+if(keys['KeyA']||keys['ArrowLeft'])r-=1;
+
+if(f!==0||r!==0){
+const inv=1/Math.hypot(f,r);
+
+f*=inv;
+r*=inv;
+
+const sy=Math.sin(player.yaw);
+const cy=Math.cos(player.yaw);
+
+player.target[0]+=(-sy*f+cy*r)*speed*dt;
+player.target[2]+=(-cy*f-sy*r)*speed*dt;
+}
+
+const groundY=
+terrainHeightJS(player.target[0],player.target[2])
++player.eye;
+
+player.target[1]+=
+(groundY-player.target[1])*
+Math.min(1,dt*14);
+
+player.pos=vec3.lerp([],player.pos,player.target,.15);
+
+const fwdX=
+player.pos[0]+
+Math.sin(player.yaw)*
+Math.cos(player.pitch);
+
+const fwdY=
+player.pos[1]+
+Math.sin(player.pitch);
+
+const fwdZ=
+player.pos[2]-
+Math.cos(player.yaw)*
+Math.cos(player.pitch);
+
+mat4.lookAt(
+viewMatrix,
+player.pos,
+[fwdX,fwdY,fwdZ],
+[0,1,0]
+);
+
+mat4.identity(modelViewMatrix);
+mat4.multiply(modelViewMatrix,viewMatrix,modelViewMatrix);
+
+mat4.perspective(
+projectionMatrix,
+Math.PI/4,
+canvas.width/canvas.height,
+.1,
+250000
+);
+
+updateLightMatrices();
+
+gl.bindFramebuffer(gl.FRAMEBUFFER,shadowFBO);
+gl.viewport(0,0,SHADOW_SIZE,SHADOW_SIZE);
+
+gl.clearColor(1,1,1,1);
+gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);
+
+gl.enable(gl.DEPTH_TEST);
+gl.depthFunc(gl.LEQUAL);
+gl.disable(gl.CULL_FACE);
+
+gl.useProgram(shadowProg);
+
+gl.uniformMatrix4fv(
+shadowU.lightViewProj,
+false,
+lightViewProj
+);
+
+gl.uniform1f(shadowU.k,TERRAIN.k);
+gl.uniform1f(shadowU.p,TERRAIN.p);
+gl.uniform1f(shadowU.m,TERRAIN.m);
+gl.uniform1i(shadowU.seed,TERRAIN.seed);
+
+gl.uniform2f(
+shadowU.cameraPos,
+player.pos[0],
+player.pos[2]
+);
+
+gl.uniform1f(
+shadowU.cellSize,
+TERRAIN.cellSize
+);
+
+gl.uniform1i(
+shadowU.gridSize,
+TERRAIN.gridSize
+);
+
+gl.bindVertexArray(terrainVAO);
+gl.drawArrays(
+gl.TRIANGLES,
+0,
+VERTEX_COUNT
+);
+
+drawHousesShadow();
+
+renderScene(time);
+renderCRT(time);
+
+frames++;
+
+if(now-fpsTimer>=500){
+const fps=frames*1000/(now-fpsTimer);
+
+infoEl.textContent=
+'FPS: '+fps.toFixed(1)+
+'  Houses: '+houseInstances.length+
+'  CRT: ON';
+
+frames=0;
+fpsTimer=now;
+}
+}
+
+requestAnimationFrame(frame);
+
+})();
+</script>
+</body>
+</html>
